@@ -85,6 +85,8 @@ pub trait Float:
     fn log10_initial_constant() -> f64;
     fn from_f64(v: f64) -> Self;
     fn to_f64(self) -> f64;
+    /// The larger of two values; both are always finite and non-negative in the kernels.
+    fn max(self, other: Self) -> Self;
 }
 
 impl Float for f32 {
@@ -105,6 +107,10 @@ impl Float for f32 {
     fn to_f64(self) -> f64 {
         self as f64
     }
+    #[inline(always)]
+    fn max(self, other: f32) -> f32 {
+        f32::max(self, other)
+    }
 }
 
 impl Float for f64 {
@@ -124,6 +130,10 @@ impl Float for f64 {
     #[inline(always)]
     fn to_f64(self) -> f64 {
         self
+    }
+    #[inline(always)]
+    fn max(self, other: f64) -> f64 {
+        f64::max(self, other)
     }
 }
 
@@ -160,6 +170,9 @@ pub trait Simd: Copy + Send + Sync + 'static {
     fn mul(self, other: Self) -> Self;
     /// `self * mul + add`, fused where the hardware supports it.
     fn mul_add(self, mul: Self, add: Self) -> Self;
+    /// Lane-wise maximum. Kernel values are finite and non-negative, so the NaN and signed-zero
+    /// conventions of the backends never matter.
+    fn max(self, other: Self) -> Self;
     #[inline(always)]
     fn zero() -> Self {
         Self::splat(Self::Elem::ZERO)
@@ -199,6 +212,10 @@ impl<T: Float> Simd for Scalar<T> {
     fn mul_add(self, mul: Self, add: Self) -> Self {
         Scalar(self.0 * mul.0 + add.0)
     }
+    #[inline(always)]
+    fn max(self, other: Self) -> Self {
+        Scalar(self.0.max(other.0))
+    }
 }
 
 /// `K` vectors treated as one, giving the kernel `K` independent dependency chains per cell so
@@ -236,6 +253,10 @@ impl<S: Simd, const K: usize> Simd for Wide<S, K> {
     #[inline(always)]
     fn mul_add(self, mul: Self, add: Self) -> Self {
         Wide(std::array::from_fn(|i| self.0[i].mul_add(mul.0[i], add.0[i])))
+    }
+    #[inline(always)]
+    fn max(self, other: Self) -> Self {
+        Wide(std::array::from_fn(|i| self.0[i].max(other.0[i])))
     }
 }
 
@@ -283,6 +304,10 @@ pub mod neon {
         fn mul_add(self, mul: Self, add: Self) -> Self {
             F32x4(unsafe { vfmaq_f32(add.0, self.0, mul.0) })
         }
+        #[inline(always)]
+        fn max(self, other: Self) -> Self {
+            F32x4(unsafe { vmaxq_f32(self.0, other.0) })
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -315,6 +340,10 @@ pub mod neon {
         fn mul_add(self, mul: Self, add: Self) -> Self {
             F64x2(unsafe { vfmaq_f64(add.0, self.0, mul.0) })
         }
+        #[inline(always)]
+        fn max(self, other: Self) -> Self {
+            F64x2(unsafe { vmaxq_f64(self.0, other.0) })
+        }
     }
 }
 
@@ -334,7 +363,7 @@ pub mod x86 {
     pub type Avx512F64Narrow = F64x8;
 
     macro_rules! x86_vector {
-        ($name:ident, $reg:ty, $elem:ty, $lanes:expr, $set1:ident, $loadu:ident, $storeu:ident, $add:ident, $mul:ident, $fmadd:ident) => {
+        ($name:ident, $reg:ty, $elem:ty, $lanes:expr, $set1:ident, $loadu:ident, $storeu:ident, $add:ident, $mul:ident, $fmadd:ident, $max:ident) => {
             #[derive(Clone, Copy)]
             pub struct $name($reg);
 
@@ -368,6 +397,10 @@ pub mod x86 {
                 fn mul_add(self, mul: Self, add: Self) -> Self {
                     $name(unsafe { $fmadd(self.0, mul.0, add.0) })
                 }
+                #[inline(always)]
+                fn max(self, other: Self) -> Self {
+                    $name(unsafe { $max(self.0, other.0) })
+                }
             }
         };
     }
@@ -382,7 +415,8 @@ pub mod x86 {
         _mm256_storeu_ps,
         _mm256_add_ps,
         _mm256_mul_ps,
-        _mm256_fmadd_ps
+        _mm256_fmadd_ps,
+        _mm256_max_ps
     );
     x86_vector!(
         F64x4,
@@ -394,7 +428,8 @@ pub mod x86 {
         _mm256_storeu_pd,
         _mm256_add_pd,
         _mm256_mul_pd,
-        _mm256_fmadd_pd
+        _mm256_fmadd_pd,
+        _mm256_max_pd
     );
     x86_vector!(
         F32x16,
@@ -406,7 +441,8 @@ pub mod x86 {
         _mm512_storeu_ps,
         _mm512_add_ps,
         _mm512_mul_ps,
-        _mm512_fmadd_ps
+        _mm512_fmadd_ps,
+        _mm512_max_ps
     );
     x86_vector!(
         F64x8,
@@ -418,6 +454,7 @@ pub mod x86 {
         _mm512_storeu_pd,
         _mm512_add_pd,
         _mm512_mul_pd,
-        _mm512_fmadd_pd
+        _mm512_fmadd_pd,
+        _mm512_max_pd
     );
 }

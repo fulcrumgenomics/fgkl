@@ -204,7 +204,7 @@ macro_rules! runner_impl {
 /// to zero costs nothing numerically because any pair whose result is that small is recomputed
 /// in double precision anyway. GKL enables the same mode.
 #[cfg(target_arch = "x86_64")]
-fn with_flush_to_zero<R>(f: impl FnOnce() -> R) -> R {
+pub(crate) fn with_flush_to_zero<R>(f: impl FnOnce() -> R) -> R {
     const FTZ_DAZ: u32 = 0x8040;
     let mut saved: u32 = 0;
     // SAFETY: stmxcsr/ldmxcsr only read and write the MXCSR register through a valid u32.
@@ -222,7 +222,7 @@ fn with_flush_to_zero<R>(f: impl FnOnce() -> R) -> R {
 
 /// Subnormals cost nothing extra on aarch64, so nothing to do.
 #[cfg(not(target_arch = "x86_64"))]
-fn with_flush_to_zero<R>(f: impl FnOnce() -> R) -> R {
+pub(crate) fn with_flush_to_zero<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 

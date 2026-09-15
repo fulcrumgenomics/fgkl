@@ -16,3 +16,11 @@ path = "src/bin/bench.rs"
 [[bin]]
 name = "pairhmm-replay"
 path = "src/bin/replay.rs"
+
+[[bin]]
+name = "pdhmm-bench"
+path = "src/bin/pdbench.rs"
+
+[[bin]]
+name = "pdhmm-replay"
+path = "src/bin/pdreplay.rs"

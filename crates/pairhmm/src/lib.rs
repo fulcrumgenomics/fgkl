@@ -9,10 +9,14 @@
 
 mod kernel;
 mod model;
+mod pd;
+mod pd_kernel;
 pub mod pdhmm;
 pub mod reference;
 mod simd;
 pub mod synthetic;
+
+pub use pd::{PdHaplotype, PdPairHmm};
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -177,10 +181,10 @@ pub struct PairHmm {
 
 /// Which kernel instantiation to use: the widest lane group only pays off when a batch can fill it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct RunnerKey {
-    backend: Backend,
-    precision: Precision,
-    wide: bool,
+pub(crate) struct RunnerKey {
+    pub backend: Backend,
+    pub precision: Precision,
+    pub wide: bool,
 }
 
 thread_local! {
@@ -392,10 +396,10 @@ impl PairHmm {
 
 /// A region's reads left over after its full wide batches use the narrow AVX-512 instantiation
 /// when there are at most this many of them.
-const NARROW_BATCH: usize = 16;
+pub(crate) const NARROW_BATCH: usize = 16;
 
-/// Whether [`make_runner`] has a separate narrow instantiation for this backend.
-fn has_narrow_instantiation(backend: Backend) -> bool {
+/// Whether the AVX-512 kernels have a separate narrow instantiation for this backend.
+pub(crate) fn has_narrow_instantiation(backend: Backend) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         backend == Backend::Avx512
@@ -439,7 +443,12 @@ pub enum Error {
     EmptyRead(usize),
     MismatchedReadArrays(usize),
     EmptyHaplotype(usize),
-    OutputLength { expected: usize, actual: usize },
+    /// A partially determined haplotype's flags differ in length from its bases.
+    MismatchedHaplotypeArrays(usize),
+    OutputLength {
+        expected: usize,
+        actual: usize,
+    },
     BackendUnavailable(Backend),
 }
 
@@ -451,6 +460,9 @@ impl fmt::Display for Error {
                 write!(f, "read {i}: bases, qualities and penalties differ in length")
             }
             Error::EmptyHaplotype(i) => write!(f, "haplotype {i} has no bases"),
+            Error::MismatchedHaplotypeArrays(i) => {
+                write!(f, "haplotype {i}: bases and flags differ in length")
+            }
             Error::OutputLength { expected, actual } => {
                 write!(f, "output has {actual} elements but reads x haplotypes is {expected}")
             }
