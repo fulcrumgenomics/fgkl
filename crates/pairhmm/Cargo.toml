@@ -1,0 +1,18 @@
+[package]
+name = "fgkl-pairhmm"
+description = "Vectorized PairHMM read-versus-haplotype likelihoods compatible with GATK's LoglessPairHMM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[[bin]]
+name = "pairhmm-bench"
+path = "src/bin/bench.rs"
+
+[[bin]]
+name = "pairhmm-replay"
+path = "src/bin/replay.rs"

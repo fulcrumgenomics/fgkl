@@ -1,0 +1,14 @@
+[package]
+name = "fgkl-smithwaterman"
+description = "Smith-Waterman alignment with GATK's gap model, overhang strategies and tie-breaking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[[bin]]
+name = "sw-bench"
+path = "src/bin/bench.rs"

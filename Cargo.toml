@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/pairhmm", "crates/smithwaterman", "crates/jni"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/fulcrumgenomics/fgkl"
+
+[profile.release]
+debug = 1
+codegen-units = 1
+lto = "fat"
+panic = "unwind"
+
+[profile.bench]
+inherits = "release"

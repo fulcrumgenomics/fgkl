@@ -1,0 +1,17 @@
+[package]
+name = "fgkl-jni"
+description = "JNI bindings exposing fgkl kernels to GATK through gatk-native-bindings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "fgkl"
+crate-type = ["cdylib"]
+
+[dependencies]
+fgkl-pairhmm = { path = "../pairhmm" }
+fgkl-smithwaterman = { path = "../smithwaterman" }
+jni = "0.21"
