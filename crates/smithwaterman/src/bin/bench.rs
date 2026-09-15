@@ -51,16 +51,27 @@ fn main() {
     }
     let params = SwParameters::new(200, -150, -260, -11);
     let cells: u64 = data.iter().map(|(r, a)| (r.len() * a.len()) as u64).sum();
-    let mut aligner = Aligner::new();
-    let mut best = f64::INFINITY;
-    for _ in 0..iters {
-        let start = Instant::now();
-        for (r, a) in &data {
-            std::hint::black_box(aligner.align(r, a, &params, OverhangStrategy::Indel).unwrap());
+    for (label, mut aligner) in
+        [("aligner:  ", Aligner::new()), ("wide only:", Aligner::new().without_narrow_lanes())]
+    {
+        let mut best = f64::INFINITY;
+        for _ in 0..iters {
+            let start = Instant::now();
+            for (r, a) in &data {
+                std::hint::black_box(
+                    aligner.align(r, a, &params, OverhangStrategy::Indel).unwrap(),
+                );
+            }
+            best = best.min(start.elapsed().as_secs_f64());
         }
-        best = best.min(start.elapsed().as_secs_f64());
+        println!(
+            "{label} {:8.1} ms  {:8.1} Mcells/s  ({} backend, {} narrow-lane fallbacks)",
+            best * 1e3,
+            cells as f64 / best / 1e6,
+            aligner.backend(),
+            aligner.narrow_fallbacks() / iters as u64
+        );
     }
-    println!("aligner:   {:8.1} ms  {:8.1} Mcells/s", best * 1e3, cells as f64 / best / 1e6);
     let start = Instant::now();
     for (r, a) in data.iter().take(pairs / 4) {
         std::hint::black_box(reference::align(r, a, &params, OverhangStrategy::Indel));

@@ -4,7 +4,9 @@
 //! and how unaligned sequence is reported.
 //!
 //! [`reference`] is a line-by-line port kept as the oracle; [`Aligner`] produces identical
-//! alignments with two score rows, reusable buffers, and one byte of traceback per cell.
+//! alignments with two score rows, reusable buffers, and one byte of traceback per cell. The SIMD
+//! backends fill the matrix anti-diagonal by anti-diagonal in 16-bit lanes first and redo the rare
+//! pair whose scores saturate them in 32-bit lanes (see `diag`).
 
 mod diag;
 pub mod reference;
@@ -12,7 +14,7 @@ mod simd;
 
 use std::fmt;
 
-use diag::{DiagFill, DiagWorkspace};
+use diag::{DiagFill, DiagWorkspace, narrow_lanes_apply};
 
 /// GATK's `MATRIX_MIN_CUTOFF`: no cell score drops below this.
 const MATRIX_MIN_CUTOFF: i32 = -100_000_000;
@@ -189,15 +191,26 @@ impl Backend {
         }
     }
 
-    fn make_fill(self) -> Option<Box<dyn DiagFill>> {
+    /// The 16-bit and 32-bit lane workspaces of this backend; none for the scalar backend.
+    #[allow(clippy::type_complexity)]
+    fn make_fills(self) -> (Option<Box<dyn DiagFill>>, Option<Box<dyn DiagFill>>) {
         match self {
-            Backend::Scalar => None,
+            Backend::Scalar => (None, None),
             #[cfg(target_arch = "aarch64")]
-            Backend::Neon => Some(Box::new(DiagWorkspace::<simd::neon::I32x4>::new())),
+            Backend::Neon => (
+                Some(Box::new(DiagWorkspace::<simd::neon::I16x8>::new())),
+                Some(Box::new(DiagWorkspace::<simd::neon::I32x4>::new())),
+            ),
             #[cfg(target_arch = "x86_64")]
-            Backend::Avx2 => Some(Box::new(DiagWorkspace::<simd::x86::I32x8>::new())),
+            Backend::Avx2 => (
+                Some(Box::new(DiagWorkspace::<simd::x86::I16x16>::new())),
+                Some(Box::new(DiagWorkspace::<simd::x86::I32x8>::new())),
+            ),
             #[cfg(target_arch = "x86_64")]
-            Backend::Avx512 => Some(Box::new(DiagWorkspace::<simd::x86::I32x16>::new())),
+            Backend::Avx512 => (
+                Some(Box::new(DiagWorkspace::<simd::x86::I16x32>::new())),
+                Some(Box::new(DiagWorkspace::<simd::x86::I32x16>::new())),
+            ),
         }
     }
 }
@@ -212,7 +225,11 @@ impl fmt::Display for Backend {
 /// intended use.
 pub struct Aligner {
     backend: Backend,
-    vector: Option<Box<dyn DiagFill>>,
+    /// The 16-bit-lane fill, tried first; absent on the scalar backend or when disabled.
+    narrow: Option<Box<dyn DiagFill>>,
+    /// The 32-bit-lane fill, used when the narrow one saturates.
+    wide: Option<Box<dyn DiagFill>>,
+    narrow_fallbacks: u64,
     h_prev: Vec<i32>,
     h_cur: Vec<i32>,
     /// Best vertical-gap score ending in each column of the current row.
@@ -237,9 +254,12 @@ impl Aligner {
     /// An aligner on a specific backend, which must be available on this CPU.
     pub fn with_backend(backend: Backend) -> Self {
         assert!(backend.is_available(), "backend {backend} is not supported by this CPU");
+        let (narrow, wide) = backend.make_fills();
         Aligner {
             backend,
-            vector: backend.make_fill(),
+            narrow,
+            wide,
+            narrow_fallbacks: 0,
             h_prev: Vec::new(),
             h_cur: Vec::new(),
             f: Vec::new(),
@@ -250,6 +270,17 @@ impl Aligner {
 
     pub fn backend(&self) -> Backend {
         self.backend
+    }
+
+    /// The same aligner using only 32-bit lanes, for measurements and tests.
+    pub fn without_narrow_lanes(mut self) -> Self {
+        self.narrow = None;
+        self
+    }
+
+    /// How many alignments so far saturated the 16-bit lanes and were redone in 32-bit lanes.
+    pub fn narrow_fallbacks(&self) -> u64 {
+        self.narrow_fallbacks
     }
 
     /// Aligns `alternate` to `reference`. Both must be non-empty.
@@ -273,11 +304,32 @@ impl Aligner {
             });
         }
         stats::record(reference, alternate, params, strategy, false);
-        if let Some(vector) = self.vector.as_mut() {
-            let (end_row, end_col, trailing) = vector.fill(reference, alternate, params, strategy);
-            let vector: &dyn DiagFill = &**vector;
+        if narrow_lanes_apply(params)
+            && let Some(narrow) = self.narrow.as_mut()
+        {
+            if let Some((end_row, end_col, trailing)) =
+                narrow.fill(reference, alternate, params, strategy)
+            {
+                let narrow: &dyn DiagFill = &**narrow;
+                return Ok(traceback(
+                    |i, j| narrow.trace_at(i, j),
+                    alternate.len(),
+                    end_row,
+                    end_col,
+                    trailing,
+                    strategy,
+                ));
+            }
+            self.narrow_fallbacks += 1;
+            stats::record_fallback(params, strategy);
+        }
+        if let Some(wide) = self.wide.as_mut()
+            && let Some((end_row, end_col, trailing)) =
+                wide.fill(reference, alternate, params, strategy)
+        {
+            let wide: &dyn DiagFill = &**wide;
             return Ok(traceback(
-                |i, j| vector.trace_at(i, j),
+                |i, j| wide.trace_at(i, j),
                 alternate.len(),
                 end_row,
                 end_col,
@@ -518,47 +570,45 @@ pub fn last_index_of(reference: &[u8], query: &[u8]) -> Option<usize> {
     (0..=reference.len() - query.len()).rev().find(|&r| &reference[r..r + query.len()] == query)
 }
 
-/// Whether an alignment of these lengths with these parameters can run in 16-bit lanes with
-/// results identical to the 32-bit kernel. Every cell holds the best score of some path to it, so
-/// no cell is below the score of the path that takes the diagonal through `min(n, m)` cells (all
-/// mismatches at worst) and one gap over the rest, and none is above `match * min(n, m)`. When
-/// both bounds fit in an i16 with room for the sentinels and one more gap step, nothing is ever
-/// clamped and the two kernels compute the same integers.
-pub fn fits_i16(reference_len: usize, alternate_len: usize, params: &SwParameters) -> bool {
-    const LIMIT: i64 = 15_000;
-    let (short, long) =
-        (reference_len.min(alternate_len) as i64, reference_len.max(alternate_len) as i64);
-    let upper = params.match_value as i64 * short;
-    let lower = params.mismatch_penalty.unsigned_abs() as i64 * short
-        + params.gap_open_penalty.unsigned_abs() as i64
-        + params.gap_extend_penalty.unsigned_abs() as i64 * (long - 1).max(0);
-    upper <= LIMIT && lower <= LIMIT
-}
-
 /// Per-parameter-set counters of what the aligner is asked to do, kept only while the
 /// environment variable `FGKL_SW_STATS` is set and written to stderr when the process exits.
-/// They say how many calls the exact-match shortcut answers, how many cells the kernel fills, and
-/// how many calls and cells `fits_i16` would send to 16-bit lanes.
+/// They say how many calls the exact-match shortcut answers, how many cells the kernel fills, how
+/// many sequence pairs repeat, and how many alignments fell back from 16-bit to 32-bit lanes.
 mod stats {
     use std::collections::{BTreeMap, HashSet};
     use std::hash::{DefaultHasher, Hash, Hasher};
     use std::sync::{Mutex, Once, OnceLock};
 
-    use super::{OverhangStrategy, SwParameters, fits_i16};
+    use super::{OverhangStrategy, SwParameters};
 
     #[derive(Default)]
     struct Counters {
         calls: u64,
         exact: u64,
         cells: u64,
-        i16_calls: u64,
-        i16_cells: u64,
+        narrow_fallbacks: u64,
         max_reference: usize,
         max_alternate: usize,
         /// Hashes of the (reference, alternate) pairs and of the alternates alone that were
         /// actually aligned, to see how many alignments repeat an earlier one.
         distinct_pairs: HashSet<u64>,
         distinct_alternates: HashSet<u64>,
+    }
+
+    fn key(params: &SwParameters, strategy: OverhangStrategy) -> Key {
+        let strategy_name = match strategy {
+            OverhangStrategy::SoftClip => "softclip",
+            OverhangStrategy::Indel => "indel",
+            OverhangStrategy::LeadingIndel => "leading_indel",
+            OverhangStrategy::Ignore => "ignore",
+        };
+        (
+            params.match_value,
+            params.mismatch_penalty,
+            params.gap_open_penalty,
+            params.gap_extend_penalty,
+            strategy_name,
+        )
     }
 
     fn hash_bytes(parts: &[&[u8]]) -> u64 {
@@ -600,21 +650,8 @@ mod stats {
                 atexit(print_at_exit);
             }
         });
-        let strategy_name = match strategy {
-            OverhangStrategy::SoftClip => "softclip",
-            OverhangStrategy::Indel => "indel",
-            OverhangStrategy::LeadingIndel => "leading_indel",
-            OverhangStrategy::Ignore => "ignore",
-        };
-        let key = (
-            params.match_value,
-            params.mismatch_penalty,
-            params.gap_open_penalty,
-            params.gap_extend_penalty,
-            strategy_name,
-        );
         let mut counters = COUNTERS.lock().unwrap();
-        let c = counters.entry(key).or_default();
+        let c = counters.entry(key(params, strategy)).or_default();
         c.calls += 1;
         c.max_reference = c.max_reference.max(reference_len);
         c.max_alternate = c.max_alternate.max(alternate_len);
@@ -626,10 +663,14 @@ mod stats {
         c.cells += cells;
         c.distinct_pairs.insert(hash_bytes(&[reference, alternate]));
         c.distinct_alternates.insert(hash_bytes(&[alternate]));
-        if fits_i16(reference_len, alternate_len, params) {
-            c.i16_calls += 1;
-            c.i16_cells += cells;
+    }
+
+    pub(super) fn record_fallback(params: &SwParameters, strategy: OverhangStrategy) {
+        if !*ENABLED.get_or_init(|| std::env::var_os("FGKL_SW_STATS").is_some()) {
+            return;
         }
+        let mut counters = COUNTERS.lock().unwrap();
+        counters.entry(key(params, strategy)).or_default().narrow_fallbacks += 1;
     }
 
     /// Writes one line per parameter set and overhang strategy to stderr.
@@ -637,15 +678,14 @@ mod stats {
         let counters = COUNTERS.lock().unwrap();
         for (&(m, x, o, e, st), c) in counters.iter() {
             eprintln!(
-                "fgkl sw stats  params={m}/{x}/{o}/{e} strategy={st} calls={} exact_match={} aligned={} distinct_pairs={} distinct_alternates={} cells={} i16_calls={} i16_cells={} max_reference={} max_alternate={}",
+                "fgkl sw stats  params={m}/{x}/{o}/{e} strategy={st} calls={} exact_match={} aligned={} distinct_pairs={} distinct_alternates={} cells={} narrow_fallbacks={} max_reference={} max_alternate={}",
                 c.calls,
                 c.exact,
                 c.calls - c.exact,
                 c.distinct_pairs.len(),
                 c.distinct_alternates.len(),
                 c.cells,
-                c.i16_calls,
-                c.i16_cells,
+                c.narrow_fallbacks,
                 c.max_reference,
                 c.max_alternate
             );
@@ -656,30 +696,6 @@ mod stats {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn read_to_haplotype_parameters_fit_i16_lanes() {
-        // GATK's ALIGNMENT_TO_BEST_HAPLOTYPE_SW_PARAMETERS, 250 bp read against a 2 kb haplotype.
-        assert!(fits_i16(2000, 250, &SwParameters::new(10, -15, -30, -5)));
-    }
-
-    #[test]
-    fn dangling_end_parameters_fit_i16_lanes() {
-        // GATK's STANDARD_NGS on read-length sequences.
-        assert!(fits_i16(200, 150, &SwParameters::new(25, -50, -110, -6)));
-    }
-
-    #[test]
-    fn haplotype_to_reference_parameters_need_i32_lanes() {
-        // GATK's NEW_SW_PARAMETERS on a padded haplotype: the best score alone exceeds i16.
-        assert!(!fits_i16(700, 620, &SwParameters::new(200, -150, -260, -11)));
-    }
-
-    #[test]
-    fn long_gaps_push_read_alignments_out_of_i16_lanes() {
-        // The lower bound grows with the gap length, not the read length.
-        assert!(!fits_i16(4000, 150, &SwParameters::new(10, -15, -30, -5)));
-    }
 
     const HAP_TO_REF: SwParameters = SwParameters::new(200, -150, -260, -11);
     const READ_TO_HAP: SwParameters = SwParameters::new(10, -15, -30, -5);
@@ -757,15 +773,83 @@ mod tests {
         strategy: OverhangStrategy,
     ) {
         let expected = reference::align(reference, alt, params, strategy);
-        let mut aligner = Aligner::new();
-        let actual = aligner.align(reference, alt, params, strategy).unwrap();
-        assert_eq!(
-            actual,
-            expected,
-            "{strategy:?} {params:?}\nref={}\nalt={}",
-            String::from_utf8_lossy(reference),
-            String::from_utf8_lossy(alt)
-        );
+        for backend in Backend::available() {
+            for narrow in [true, false] {
+                let mut aligner = Aligner::with_backend(backend);
+                if !narrow {
+                    aligner = aligner.without_narrow_lanes();
+                }
+                let actual = aligner.align(reference, alt, params, strategy).unwrap();
+                assert_eq!(
+                    actual,
+                    expected,
+                    "{backend} narrow={narrow} {strategy:?} {params:?}\nref={}\nalt={}",
+                    String::from_utf8_lossy(reference),
+                    String::from_utf8_lossy(alt)
+                );
+            }
+        }
+    }
+
+    /// Runs one pair on every SIMD backend with 16-bit lanes and returns how many fell back.
+    fn narrow_fallbacks_on_simd_backends(
+        reference: &[u8],
+        alt: &[u8],
+        params: &SwParameters,
+        strategy: OverhangStrategy,
+    ) -> Vec<(Backend, u64)> {
+        Backend::available()
+            .into_iter()
+            .filter(|&b| b != Backend::Scalar)
+            .map(|backend| {
+                let mut aligner = Aligner::with_backend(backend);
+                let actual = aligner.align(reference, alt, params, strategy).unwrap();
+                assert_eq!(actual, reference::align(reference, alt, params, strategy));
+                (backend, aligner.narrow_fallbacks())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn weak_alignments_saturate_the_narrow_lanes_and_fall_back_exactly() {
+        // Two unrelated 700-mers under the haplotype-to-reference scores: the best local alignment
+        // is short, so relative to the anti-diagonal every end candidate is deep in saturation.
+        let mut rng = Rng(23);
+        let r: Vec<u8> = (0..700).map(|_| rng.base()).collect();
+        let a: Vec<u8> = (0..700).map(|_| rng.base()).collect();
+        for (backend, fallbacks) in
+            narrow_fallbacks_on_simd_backends(&r, &a, &HAP_TO_REF, OverhangStrategy::SoftClip)
+        {
+            assert_eq!(fallbacks, 1, "{backend} should have fallen back once");
+        }
+    }
+
+    #[test]
+    fn a_haplotype_matching_the_far_end_of_the_reference_stays_in_narrow_lanes() {
+        // Many last-column candidates saturate (short alternate prefixes against a long reference
+        // prefix), but their bounds stay below the real end, so no fallback is needed.
+        let mut rng = Rng(29);
+        let r: Vec<u8> = (0..600).map(|_| rng.base()).collect();
+        let mut a = r[380..].to_vec();
+        a[100] = if a[100] == b'A' { b'C' } else { b'A' };
+        for (backend, fallbacks) in
+            narrow_fallbacks_on_simd_backends(&r, &a, &HAP_TO_REF, OverhangStrategy::SoftClip)
+        {
+            assert_eq!(fallbacks, 0, "{backend} should not have fallen back");
+        }
+    }
+
+    #[test]
+    fn odd_match_values_are_scaled_into_the_relative_encoding() {
+        let mut rng = Rng(31);
+        let dangling = SwParameters::new(25, -50, -110, -6);
+        for _ in 0..50 {
+            let (ref_len, alt_len) = (40 + rng.below(200), 20 + rng.below(150));
+            let (r, a) = related_pair(&mut rng, ref_len, alt_len);
+            for strategy in STRATEGIES {
+                assert_same(&r, &a, &dangling, strategy);
+            }
+        }
     }
 
     #[test]
