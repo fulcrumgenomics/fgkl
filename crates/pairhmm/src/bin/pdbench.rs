@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use fgkl_pairhmm::synthetic::PdRegion;
-use fgkl_pairhmm::{Backend, Config, PairHmm, PdPairHmm, Precision, pdhmm};
+use fgkl_pairhmm::{Backend, Config, PairHmm, PdPairHmm, Precision, pd_reference};
 
 struct Args {
     reads: usize,
@@ -45,13 +45,7 @@ impl Args {
                 "--iters" => args.iters = value.parse().unwrap(),
                 "--seed" => args.seed = value.parse().unwrap(),
                 "--backend" => args.backend = Some(value.parse().unwrap()),
-                "--precision" => {
-                    args.precision = Some(match value.as_str() {
-                        "float" => Precision::Float,
-                        "double" => Precision::Double,
-                        other => panic!("unknown precision {other}"),
-                    })
-                }
+                "--precision" => args.precision = Some(value.parse().unwrap()),
                 other => panic!("unknown flag {other}"),
             }
         }
@@ -72,7 +66,7 @@ fn main() {
     let mut expected = Vec::with_capacity(sample * n_haps);
     for read in &reads[..sample] {
         for hap in &haps {
-            expected.push(pdhmm::reference_log10_likelihood(hap.bases, hap.flags, read));
+            expected.push(pd_reference::log10_likelihood(hap.bases, hap.flags, read));
         }
     }
 
@@ -93,13 +87,10 @@ fn main() {
     for &backend in &backends {
         for &precision in &precisions {
             let config = Config { precision, backend: Some(backend), double_fallback: true };
-            let prec = match precision {
-                Precision::Float => "float",
-                Precision::Double => "double",
-            };
             let hmm = PdPairHmm::new(&config).unwrap();
+            hmm.compute_log10_likelihoods(&reads, &haps, &mut out).unwrap();
             let mut best = f64::INFINITY;
-            for _ in 0..=args.iters {
+            for _ in 0..args.iters {
                 let start = Instant::now();
                 hmm.compute_log10_likelihoods(&reads, &haps, &mut out).unwrap();
                 best = best.min(start.elapsed().as_secs_f64());
@@ -113,7 +104,7 @@ fn main() {
             println!(
                 "{:<8} {:<7} {:<6} {:>10.2} {:>12.1} {:>12.2e} {:>10}",
                 backend.name(),
-                prec,
+                precision.name(),
                 "pd",
                 best * 1e3,
                 cells as f64 / best / 1e6,
@@ -121,8 +112,9 @@ fn main() {
                 fallbacks
             );
             let plain_hmm = PairHmm::new(&config).unwrap();
+            plain_hmm.compute_log10_likelihoods(&reads, &plain, &mut out).unwrap();
             let mut best = f64::INFINITY;
-            for _ in 0..=args.iters {
+            for _ in 0..args.iters {
                 let start = Instant::now();
                 plain_hmm.compute_log10_likelihoods(&reads, &plain, &mut out).unwrap();
                 best = best.min(start.elapsed().as_secs_f64());
@@ -130,7 +122,7 @@ fn main() {
             println!(
                 "{:<8} {:<7} {:<6} {:>10.2} {:>12.1} {:>12} {:>10}",
                 backend.name(),
-                prec,
+                precision.name(),
                 "plain",
                 best * 1e3,
                 cells as f64 / best / 1e6,

@@ -17,6 +17,9 @@ import java.util.EnumSet;
  * <p>The library is looked up at {@code /native/<os>-<arch>/<libfgkl>} inside the JAR. Setting the
  * system property {@code fgkl.library.path} to a directory loads the library from there instead,
  * which is how a locally built library is tested without repackaging.
+ *
+ * <p>A JVM can load a given native library into one class loader only; a second class loader
+ * (for example a Spark executor's) asking for it gets the JVM's own {@code UnsatisfiedLinkError}.
  */
 public final class NativeLoader {
     private static final String LIBRARY = "fgkl";
@@ -61,14 +64,24 @@ public final class NativeLoader {
                 temp = createTempFile(dir, extension);
             }
             Files.copy(in, temp, StandardCopyOption.REPLACE_EXISTING);
-            System.load(temp.toAbsolutePath().toString());
+            try {
+                System.load(temp.toAbsolutePath().toString());
+            } catch (UnsatisfiedLinkError e) {
+                UnsatisfiedLinkError wrapped = new UnsatisfiedLinkError("Failed to load the fgkl native library from " + temp
+                        + " (a noexec temp directory is the usual cause: set -Djava.io.tmpdir, pass a tempDir, or point -D"
+                        + PATH_PROPERTY + " at a directory holding the library): " + e.getMessage());
+                wrapped.initCause(e);
+                throw wrapped;
+            }
             try {
                 Files.delete(temp);
             } catch (IOException ignored) {
                 temp.toFile().deleteOnExit();
             }
         } catch (IOException e) {
-            throw new UnsatisfiedLinkError("Failed to extract the fgkl native library: " + e.getMessage());
+            UnsatisfiedLinkError wrapped = new UnsatisfiedLinkError("Failed to extract the fgkl native library: " + e.getMessage());
+            wrapped.initCause(e);
+            throw wrapped;
         }
         loaded = true;
     }

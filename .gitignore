@@ -1,7 +1,8 @@
 /target
 /build
 /.gradle
-/src/main/resources/native/
+/.kotlin
 *.iml
 .idea/
 .DS_Store
+.Rhistory

@@ -1,112 +1,67 @@
 //! Partially determined PairHMM likelihoods for GATK's DRAGEN 3.7.8 concordance mode, numerically
 //! equivalent to GATK's Java `LoglessPDPairHMM` and to Intel GKL's `IntelPDHMM`.
 //!
-//! The batching mirrors [`PairHmm`](crate::PairHmm): reads fill SIMD lanes, single precision is
-//! the default with double-precision recomputation of any pair that underflows, and every call
-//! runs on the calling thread, and haplotypes sharing a prefix of bases and flags share its DP
-//! columns.
+//! [`PdPairHmm`] drives the kernel in `pd_kernel.rs` through the same [`Batcher`] as
+//! [`PairHmm`](crate::PairHmm): reads fill SIMD lanes, single precision is the default with
+//! double-precision recomputation of any pair that underflows, every call runs on the calling
+//! thread, and haplotypes sharing a prefix of bases and flags share its DP columns.
 
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::pd_kernel::SortedPdHaps;
+use crate::{Backend, Precision};
+use crate::{Batcher, Config, Error, ReadRef};
 
-use crate::pd_kernel::{PdBatchRunner, PdHaps, PdRunner};
-use crate::{
-    Backend, Config, Error, NARROW_BATCH, Precision, ReadRef, RunnerKey, has_narrow_instantiation,
-    simd,
-};
+/// Flag bits of a partially determined haplotype base (GATK's `PartiallyDeterminedHaplotype`).
+/// A `SNP` column's `ALT_*` bits name the alternate bases a read may match there.
+pub const SNP: u8 = 1;
+/// First base a read may skip.
+pub const DEL_START: u8 = 2;
+/// Last base a read may skip; a single-base deletion carries both flags.
+pub const DEL_END: u8 = 4;
+/// Alternate base `A` at a `SNP` column.
+pub const ALT_A: u8 = 8;
+/// Alternate base `C` at a `SNP` column.
+pub const ALT_C: u8 = 16;
+/// Alternate base `G` at a `SNP` column.
+pub const ALT_G: u8 = 32;
+/// Alternate base `T` at a `SNP` column.
+pub const ALT_T: u8 = 64;
 
-/// A partially determined haplotype: its bases and, per base, the flags of [`crate::pdhmm`]
-/// (`SNP` with `ALT_*` bits, `DEL_START`, `DEL_END`). Both slices have the same length.
+/// A partially determined haplotype: its bases and, per base, the flags above. Both slices have
+/// the same length.
 #[derive(Clone, Copy, Debug)]
 pub struct PdHaplotype<'a> {
+    /// The determined bases.
     pub bases: &'a [u8],
+    /// Per base, the `SNP`/`ALT_*`/`DEL_START`/`DEL_END` bits; zero for a plain base.
     pub flags: &'a [u8],
 }
 
 /// A configured partially determined PairHMM. Cheap to call repeatedly and safe to share between
 /// threads; each call computes on the calling thread.
 pub struct PdPairHmm {
-    precision: Precision,
-    backend: Backend,
-    double_fallback: bool,
-    /// Pairs whose single-precision result underflowed, summed over every call.
-    fallback_pairs: AtomicU64,
-}
-
-thread_local! {
-    /// PD kernel workspaces, reused across calls on the same thread like the plain kernel's.
-    static PD_RUNNERS: RefCell<Vec<(RunnerKey, Box<dyn PdBatchRunner>)>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Runs `f` with the cached PD runner for `key`, creating it on first use.
-fn with_pd_runner<R>(key: RunnerKey, f: impl FnOnce(&mut dyn PdBatchRunner) -> R) -> R {
-    PD_RUNNERS.with(|cell| {
-        let mut runners = cell.borrow_mut();
-        let index = match runners.iter().position(|(k, _)| *k == key) {
-            Some(i) => i,
-            None => {
-                runners.push((key, make_pd_runner(key)));
-                runners.len() - 1
-            }
-        };
-        f(runners[index].1.as_mut())
-    })
-}
-
-fn make_pd_runner(key: RunnerKey) -> Box<dyn PdBatchRunner> {
-    use simd::{ScalarF32, ScalarF64};
-    #[cfg(target_arch = "x86_64")]
-    if key.backend == Backend::Avx512 && !key.wide {
-        return match key.precision {
-            Precision::Float => Box::new(PdRunner::<simd::x86::Avx512F32Narrow>::new()),
-            Precision::Double => Box::new(PdRunner::<simd::x86::Avx512F64Narrow>::new()),
-        };
-    }
-    match (key.backend, key.precision) {
-        (Backend::Scalar, Precision::Float) => Box::new(PdRunner::<ScalarF32>::new()),
-        (Backend::Scalar, Precision::Double) => Box::new(PdRunner::<ScalarF64>::new()),
-        #[cfg(target_arch = "aarch64")]
-        (Backend::Neon, Precision::Float) => Box::new(PdRunner::<simd::neon::NeonF32>::new()),
-        #[cfg(target_arch = "aarch64")]
-        (Backend::Neon, Precision::Double) => Box::new(PdRunner::<simd::neon::NeonF64>::new()),
-        #[cfg(target_arch = "x86_64")]
-        (Backend::Avx2, Precision::Float) => Box::new(PdRunner::<simd::x86::Avx2F32>::new()),
-        #[cfg(target_arch = "x86_64")]
-        (Backend::Avx2, Precision::Double) => Box::new(PdRunner::<simd::x86::Avx2F64>::new()),
-        #[cfg(target_arch = "x86_64")]
-        (Backend::Avx512, Precision::Float) => Box::new(PdRunner::<simd::x86::Avx512F32>::new()),
-        #[cfg(target_arch = "x86_64")]
-        (Backend::Avx512, Precision::Double) => Box::new(PdRunner::<simd::x86::Avx512F64>::new()),
-    }
+    inner: Batcher,
 }
 
 impl PdPairHmm {
+    /// Builds a PD PairHMM for `config`, failing if the requested backend is unavailable.
     pub fn new(config: &Config) -> Result<Self, Error> {
-        let backend = config.backend.unwrap_or_else(Backend::detect);
-        if !backend.is_available() {
-            return Err(Error::BackendUnavailable(backend));
-        }
-        Ok(PdPairHmm {
-            precision: config.precision,
-            backend,
-            double_fallback: config.double_fallback,
-            fallback_pairs: AtomicU64::new(0),
-        })
+        Ok(PdPairHmm { inner: Batcher::new(config)? })
     }
 
+    /// The vector instruction set in use.
     pub fn backend(&self) -> Backend {
-        self.backend
+        self.inner.backend
     }
 
+    /// The arithmetic precision in use.
     pub fn precision(&self) -> Precision {
-        self.precision
+        self.inner.precision
     }
 
     /// How many pairs so far underflowed in single precision and were (or, with
     /// `double_fallback` off, would have been) recomputed in double precision.
     pub fn fallback_pairs(&self) -> u64 {
-        self.fallback_pairs.load(Ordering::Relaxed)
+        self.inner.fallback_pairs()
     }
 
     /// Computes every read against every haplotype, writing the log10 likelihood of read `r`
@@ -135,139 +90,22 @@ impl PdPairHmm {
         if expected == 0 {
             return Ok(());
         }
-
-        let pairs: Vec<(&[u8], &[u8])> = haplotypes.iter().map(|h| (h.bases, h.flags)).collect();
-        let haps = PdHaps::new(&pairs);
-        let n_haps = haps.len();
-        // Longest reads first so that the lanes of a batch have similar lengths.
-        let mut read_order: Vec<usize> = (0..reads.len()).collect();
-        read_order.sort_by_key(|&i| std::cmp::Reverse(reads[i].len()));
-        let sorted_reads: Vec<ReadRef<'_>> = read_order.iter().map(|&i| reads[i]).collect();
-
-        let mut tmp = vec![0.0f64; expected];
-        let fallback = self.run_pass(self.precision, &sorted_reads, &haps, &mut tmp);
-        if !fallback.is_empty() {
-            self.fallback_pairs.fetch_add(fallback.len() as u64, Ordering::Relaxed);
-            if self.double_fallback {
-                self.run_fallback(&fallback, &sorted_reads, &haps, &mut tmp);
-            }
-        }
-        for (pos, &read) in read_order.iter().enumerate() {
-            for (k, &hap) in haps.order.iter().enumerate() {
-                out[read * n_haps + hap] = tmp[pos * n_haps + k];
-            }
-        }
+        self.inner.compute(reads, &SortedPdHaps::new(haplotypes), out);
         Ok(())
     }
+}
 
-    /// Runs every batch of reads against all haplotypes, returning the `(read, haplotype)` pairs
-    /// whose result must be recomputed in double precision.
-    fn run_pass(
-        &self,
-        precision: Precision,
-        reads: &[ReadRef<'_>],
-        haps: &PdHaps<'_>,
-        tmp: &mut [f64],
-    ) -> Vec<(usize, usize)> {
-        let wide = RunnerKey { backend: self.backend, precision, wide: true };
-        let narrow = RunnerKey { backend: self.backend, precision, wide: false };
-        let n = reads.len();
-        let split = if has_narrow_instantiation(self.backend) {
-            let wide_lanes = with_pd_runner(wide, |runner| runner.lanes());
-            let rest = n % wide_lanes;
-            if rest <= NARROW_BATCH { n - rest } else { n }
-        } else {
-            n
-        };
-        let mut fallback = Vec::new();
-        let (head, tail) = tmp.split_at_mut(split * haps.len());
-        Self::run_batches(wide, &reads[..split], haps, head, 0, &mut fallback);
-        Self::run_batches(narrow, &reads[split..], haps, tail, split, &mut fallback);
-        fallback
+/// Whether a read base matches the alternate SNP alleles encoded in a haplotype flag byte.
+pub fn base_matches_pd(read_base: u8, flags: u8) -> bool {
+    if flags & SNP == 0 {
+        return false;
     }
-
-    /// Runs `reads` in batches of the runner's lane count, recording fallback pairs with their
-    /// read index offset by `first_read`.
-    fn run_batches(
-        key: RunnerKey,
-        reads: &[ReadRef<'_>],
-        haps: &PdHaps<'_>,
-        tmp: &mut [f64],
-        first_read: usize,
-        fallback: &mut Vec<(usize, usize)>,
-    ) {
-        if reads.is_empty() {
-            return;
-        }
-        with_pd_runner(key, |runner| {
-            let lanes = runner.lanes();
-            let n_haps = haps.len();
-            let mut batch = Vec::new();
-            for (b, out) in tmp.chunks_mut(lanes * n_haps).enumerate() {
-                let lo = b * lanes;
-                let hi = (lo + lanes).min(reads.len());
-                batch.clear();
-                runner.run(&reads[lo..hi], haps, out, &mut batch);
-                fallback.extend(batch.iter().map(|&(r, h)| (first_read + lo + r, h)));
-            }
-        })
-    }
-
-    /// Recomputes the given `(read, sorted haplotype)` pairs in double precision. A read that
-    /// underflowed against a third or more of the haplotypes is run against all of them in one
-    /// prefix-shared sweep; the other pairs are grouped by haplotype and run one haplotype at a
-    /// time with their reads packed into lanes.
-    fn run_fallback(
-        &self,
-        pairs: &[(usize, usize)],
-        reads: &[ReadRef<'_>],
-        haps: &PdHaps<'_>,
-        tmp: &mut [f64],
-    ) {
-        let n_haps = haps.len();
-        let mut per_read: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for &(r, h) in pairs {
-            per_read.entry(r).or_default().push(h);
-        }
-        let dense: Vec<usize> =
-            per_read.iter().filter(|(_, hs)| hs.len() * 3 >= n_haps).map(|(&r, _)| r).collect();
-        if !dense.is_empty() {
-            let batch: Vec<ReadRef<'_>> = dense.iter().map(|&r| reads[r]).collect();
-            let mut out = vec![0.0f64; batch.len() * n_haps];
-            let none = self.run_pass(Precision::Double, &batch, haps, &mut out);
-            debug_assert!(none.is_empty(), "double precision never falls back");
-            for (i, &r) in dense.iter().enumerate() {
-                for &h in &per_read[&r] {
-                    tmp[r * n_haps + h] = out[i * n_haps + h];
-                }
-            }
-            for r in &dense {
-                per_read.remove(r);
-            }
-        }
-        let mut by_hap: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for (&r, hs) in &per_read {
-            for &h in hs {
-                by_hap.entry(h).or_default().push(r);
-            }
-        }
-        let key = RunnerKey { backend: self.backend, precision: Precision::Double, wide: false };
-        with_pd_runner(key, |runner| {
-            let lanes = runner.lanes();
-            let mut out = vec![0.0f64; lanes];
-            let mut none = Vec::new();
-            for (h, read_positions) in by_hap {
-                let single = PdHaps::new(&[(haps.bases[h], haps.flags[h])]);
-                for chunk in read_positions.chunks(lanes) {
-                    let batch: Vec<ReadRef<'_>> = chunk.iter().map(|&p| reads[p]).collect();
-                    runner.run(&batch, &single, &mut out[..batch.len()], &mut none);
-                    for (i, &p) in chunk.iter().enumerate() {
-                        tmp[p * n_haps + h] = out[i];
-                    }
-                }
-            }
-            debug_assert!(none.is_empty(), "double precision never falls back");
-        });
+    match read_base {
+        b'A' | b'a' => flags & ALT_A != 0,
+        b'C' | b'c' => flags & ALT_C != 0,
+        b'G' | b'g' => flags & ALT_G != 0,
+        b'T' | b't' => flags & ALT_T != 0,
+        _ => false,
     }
 }
 
@@ -275,14 +113,14 @@ impl PdPairHmm {
 mod tests {
     use super::*;
     use crate::PairHmm;
-    use crate::pdhmm::{self, ALT_C, ALT_G, ALT_T, DEL_END, DEL_START, SNP};
-    use crate::synthetic::{self, PdHap, PdRegion, Read};
+    use crate::pd_reference;
+    use crate::synthetic::{self, PdRegion, Read};
 
     fn reference_all(reads: &[ReadRef<'_>], haps: &[PdHaplotype<'_>]) -> Vec<f64> {
         let mut out = Vec::with_capacity(reads.len() * haps.len());
         for read in reads {
             for hap in haps {
-                out.push(pdhmm::reference_log10_likelihood(hap.bases, hap.flags, read));
+                out.push(pd_reference::log10_likelihood(hap.bases, hap.flags, read));
             }
         }
         out
@@ -623,13 +461,5 @@ mod tests {
             Err(Error::OutputLength { expected: 2, actual: 1 })
         );
         assert!(hmm.compute_log10_likelihoods(&[], &[hap], &mut []).is_ok());
-    }
-
-    #[test]
-    fn synthetic_region_reads_are_valid_and_haplotypes_carry_flags() {
-        let region = region();
-        assert!(region.reads.iter().all(|r| !r.bases.is_empty()));
-        assert!(region.haplotypes.iter().any(|h: &PdHap| h.flags.iter().any(|&f| f != 0)));
-        assert!(region.cells() > 0);
     }
 }

@@ -7,7 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[dependencies]
 
 [[bin]]
 name = "pairhmm-bench"

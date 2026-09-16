@@ -320,6 +320,7 @@ impl<V: SimdInt> DiagWorkspace<V> {
 
     #[inline(always)]
     fn trace_at_impl(&self, i: usize, j: usize) -> u8 {
+        debug_assert!(i >= 1 && j >= 1, "traceback never reads the boundary row or column");
         let d = i + j;
         let i_lo = d.saturating_sub(self.alt_len).max(1);
         self.trace[self.diag_start[d] + (i - i_lo)]
@@ -372,8 +373,6 @@ macro_rules! diag_fill_impl {
     };
 }
 
-diag_fill_impl!(crate::simd::ScalarI32);
-diag_fill_impl!(crate::simd::ScalarI16);
 #[cfg(target_arch = "aarch64")]
 diag_fill_impl!(crate::simd::neon::I32x4);
 #[cfg(target_arch = "aarch64")]

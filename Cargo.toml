@@ -10,10 +10,15 @@ license = "MIT"
 repository = "https://github.com/fulcrumgenomics/fgkl"
 
 [profile.release]
-debug = 1
 codegen-units = 1
 lto = "fat"
+# The JNI entry points rely on `catch_unwind` to turn a kernel panic into a Java exception; with
+# `abort` a panic would take the JVM down.
 panic = "unwind"
+# The shipped library carries no debug info; use the `profiling` profile for samply/perf work.
+strip = "debuginfo"
 
-[profile.bench]
+[profile.profiling]
 inherits = "release"
+debug = 1
+strip = "none"

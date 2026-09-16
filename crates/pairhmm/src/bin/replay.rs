@@ -26,6 +26,55 @@ fn phred(s: &str) -> Vec<u8> {
     s.bytes().map(|b| b - 33).collect()
 }
 
+fn fastq(quals: &[u8]) -> String {
+    quals.iter().map(|&q| (q + 33) as char).collect()
+}
+
+/// Writes one region back out in the dump format, so it can be replayed on its own.
+fn write_region_dump(r: &Region, file: &str) {
+    let mut out = String::from(
+        "# hap-bases read-bases read-qual read-ins-qual read-del-qual gcp expected-result\n",
+    );
+    for (ri, read) in r.reads.iter().enumerate() {
+        for (hi, hap) in r.haps.iter().enumerate() {
+            out.push_str(&format!(
+                "{} {} {} {} {} {} {:e}\n",
+                String::from_utf8_lossy(hap),
+                String::from_utf8_lossy(&read.bases),
+                fastq(&read.quals),
+                fastq(&read.ins_gop),
+                fastq(&read.del_gop),
+                fastq(&read.gcp),
+                r.expected[ri * r.haps.len() + hi]
+            ));
+        }
+    }
+    std::fs::write(file, out).expect("write region dump");
+}
+
+/// Prints every pair of `r` whose kernel result is non-finite or further than `threshold` from
+/// GATK's, with the inputs needed to reproduce it.
+fn report_bad_pairs(region_index: usize, r: &Region, out: &[f64], threshold: f64) {
+    let n = r.haps.len();
+    for (k, (a, e)) in out.iter().zip(&r.expected).enumerate() {
+        if a.is_finite() && (a - e).abs() <= threshold {
+            continue;
+        }
+        let (ri, hi) = (k / n, k % n);
+        let read = &r.reads[ri];
+        eprintln!(
+            "BAD region={region_index} read={ri} hap={hi} got={a} expected={e} nreads={} nhaps={n}\nHAP {}\nBASES {}\nQUALS {}\nINS {}\nDEL {}\nGCP {}",
+            r.reads.len(),
+            String::from_utf8_lossy(&r.haps[hi]),
+            String::from_utf8_lossy(&read.bases),
+            fastq(&read.quals),
+            fastq(&read.ins_gop),
+            fastq(&read.del_gop),
+            fastq(&read.gcp)
+        );
+    }
+}
+
 fn parse(path: &str, max_regions: usize) -> Vec<Region> {
     let file = std::fs::File::open(path).expect("open dump");
     let mut regions: Vec<Region> = Vec::new();
@@ -113,49 +162,39 @@ fn main() {
     let mut only_region: Option<usize> = None;
     let mut dump_region: Option<(usize, String)> = None;
     let mut write_results: Option<String> = None;
-    let mut i = 1;
-    while i + 1 < args.len() {
-        match args[i].as_str() {
-            "--backend" => backend = Some(args[i + 1].parse().unwrap()),
-            "--iters" => iters = args[i + 1].parse().unwrap(),
-            "--max-regions" => max_regions = args[i + 1].parse().unwrap(),
-            "--only-region" => only_region = Some(args[i + 1].parse().unwrap()),
-            "--write-results" => write_results = Some(args[i + 1].clone()),
+    let mut rest = args[1..].iter();
+    let value = |flag: &str, v: Option<&String>| -> String {
+        v.cloned().unwrap_or_else(|| panic!("{flag} needs a value"))
+    };
+    while let Some(flag) = rest.next() {
+        match flag.as_str() {
+            "--backend" => backend = Some(value(flag, rest.next()).parse().unwrap()),
+            "--iters" => iters = value(flag, rest.next()).parse().unwrap(),
+            "--max-regions" => max_regions = value(flag, rest.next()).parse().unwrap(),
+            "--only-region" => only_region = Some(value(flag, rest.next()).parse().unwrap()),
+            "--write-results" => write_results = Some(value(flag, rest.next())),
             "--dump-region" => {
-                dump_region = Some((args[i + 1].parse().unwrap(), args[i + 2].clone()));
-                i += 1;
+                let index = value(flag, rest.next()).parse().unwrap();
+                dump_region = Some((index, value(flag, rest.next())));
             }
             other => panic!("unknown flag {other}"),
         }
-        i += 2;
     }
+    // `FGKL_REPLAY_DEBUG[=threshold]` prints every pair whose result is non-finite or further
+    // than the threshold (default 0.5 log10) from GATK's.
+    let debug_threshold: Option<f64> =
+        std::env::var_os("FGKL_REPLAY_DEBUG").map(|v| v.to_string_lossy().parse().unwrap_or(0.5));
     let mut regions = parse(path, max_regions);
     if let Some((n, file)) = dump_region {
-        // Write one region back out in the dump format, so it can be replayed on its own.
-        let r = &regions[n];
-        let fq = |v: &[u8]| -> String { v.iter().map(|&q| (q + 33) as char).collect() };
-        let mut out = String::from(
-            "# hap-bases read-bases read-qual read-ins-qual read-del-qual gcp expected-result\n",
-        );
-        for (ri, read) in r.reads.iter().enumerate() {
-            for (hi, hap) in r.haps.iter().enumerate() {
-                out.push_str(&format!(
-                    "{} {} {} {} {} {} {:e}\n",
-                    String::from_utf8_lossy(hap),
-                    String::from_utf8_lossy(&read.bases),
-                    fq(&read.quals),
-                    fq(&read.ins_gop),
-                    fq(&read.del_gop),
-                    fq(&read.gcp),
-                    r.expected[ri * r.haps.len() + hi]
-                ));
-            }
-        }
-        std::fs::write(&file, out).expect("write region dump");
-        eprintln!("wrote region {n} ({} reads x {} haps) to {file}", r.reads.len(), r.haps.len());
+        write_region_dump(&regions[n], &file);
+        eprintln!("wrote region {n} to {file}");
     }
     if let Some(n) = only_region {
         regions = vec![regions.swap_remove(n)];
+    }
+    if regions.is_empty() {
+        eprintln!("no complete regions found in {path}");
+        std::process::exit(1);
     }
     let pairs: usize = regions.iter().map(|r| r.expected.len()).sum();
     let cells: u64 = regions
@@ -218,38 +257,15 @@ fn main() {
         for it in 0..iters {
             let counted_before = hmm.fallback_pairs();
             let start = Instant::now();
-            for r in &regions {
+            for (region_index, r) in regions.iter().enumerate() {
                 let reads: Vec<ReadRef<'_>> = r.reads.iter().map(Read::as_ref).collect();
                 let haps: Vec<&[u8]> = r.haps.iter().map(Vec::as_slice).collect();
                 let mut out = vec![0.0; r.expected.len()];
                 hmm.compute_log10_likelihoods(&reads, &haps, &mut out).unwrap();
-                if it == 0 && std::env::var_os("FGKL_REPLAY_DEBUG").is_some() {
-                    let threshold: f64 = std::env::var("FGKL_REPLAY_DEBUG")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0.5);
-                    let n = haps.len();
-                    for (k, (a, e)) in out.iter().zip(&r.expected).enumerate() {
-                        if !a.is_finite() || (a - e).abs() > threshold {
-                            let (ri, hi) = (k / n, k % n);
-                            let read = &r.reads[ri];
-                            let fq = |v: &[u8]| -> String {
-                                v.iter().map(|&q| (q + 33) as char).collect()
-                            };
-                            eprintln!(
-                                "BAD region={} read={ri} hap={hi} got={a} expected={e} nreads={} nhaps={}\nHAP {}\nBASES {}\nQUALS {}\nINS {}\nDEL {}\nGCP {}",
-                                regions.iter().position(|x| std::ptr::eq(x, r)).unwrap(),
-                                r.reads.len(),
-                                n,
-                                String::from_utf8_lossy(haps[hi]),
-                                String::from_utf8_lossy(&read.bases),
-                                fq(&read.quals),
-                                fq(&read.ins_gop),
-                                fq(&read.del_gop),
-                                fq(&read.gcp)
-                            );
-                        }
-                    }
+                if it == 0
+                    && let Some(threshold) = debug_threshold
+                {
+                    report_bad_pairs(region_index, r, &out, threshold);
                 }
                 if it == 0 {
                     if write_results.is_some() {

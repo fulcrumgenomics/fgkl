@@ -10,7 +10,9 @@ use std::io::{BufRead, BufReader};
 use std::time::Instant;
 
 use fgkl_pairhmm::synthetic::Read;
-use fgkl_pairhmm::{Backend, Config, PdHaplotype, PdPairHmm, Precision, ReadRef, pdhmm};
+use fgkl_pairhmm::{
+    Backend, Config, DEL_END, DEL_START, PdHaplotype, PdPairHmm, Precision, ReadRef,
+};
 
 struct Hap {
     bases: Vec<u8>,
@@ -119,10 +121,10 @@ fn row_end_state(flags: &[u8]) -> u8 {
         if state == 2 {
             state = 0;
         }
-        if f & pdhmm::DEL_START != 0 {
+        if f & DEL_START != 0 {
             state = 1;
         }
-        if f & pdhmm::DEL_END != 0 {
+        if f & DEL_END != 0 {
             state = 2;
         }
     }
@@ -135,17 +137,23 @@ fn main() {
     let mut backend: Option<Backend> = None;
     let mut iters = 2usize;
     let mut max_regions = usize::MAX;
-    let mut i = 1;
-    while i + 1 < args.len() {
-        match args[i].as_str() {
-            "--backend" => backend = Some(args[i + 1].parse().unwrap()),
-            "--iters" => iters = args[i + 1].parse().unwrap(),
-            "--max-regions" => max_regions = args[i + 1].parse().unwrap(),
+    let mut rest = args[1..].iter();
+    let value = |flag: &str, v: Option<&String>| -> String {
+        v.cloned().unwrap_or_else(|| panic!("{flag} needs a value"))
+    };
+    while let Some(flag) = rest.next() {
+        match flag.as_str() {
+            "--backend" => backend = Some(value(flag, rest.next()).parse().unwrap()),
+            "--iters" => iters = value(flag, rest.next()).parse().unwrap(),
+            "--max-regions" => max_regions = value(flag, rest.next()).parse().unwrap(),
             other => panic!("unknown flag {other}"),
         }
-        i += 2;
     }
     let regions = parse(path, max_regions);
+    if regions.is_empty() {
+        eprintln!("no complete regions found in {path}");
+        std::process::exit(1);
+    }
     let pairs: usize = regions.iter().map(|r| r.expected.len()).sum();
     let mut cells = 0u64;
     let mut shareable = 0u64;
@@ -195,8 +203,8 @@ fn main() {
         100.0 * flagged_cols as f64 / total_cols as f64,
     );
     println!(
-        "{:<8} {:<7} {:>10} {:>12} {:>12} {:>10}",
-        "backend", "prec", "ms", "Mcells/s", "max|err|", "fallbacks"
+        "{:<8} {:<7} {:>10} {:>12} {:>12} {:>10} {:>18}",
+        "backend", "prec", "ms", "Mcells/s", "max|err|", "fallbacks", "checksum"
     );
     for precision in [Precision::Float, Precision::Double] {
         let config = Config { precision, backend, double_fallback: true };
@@ -204,6 +212,8 @@ fn main() {
         let mut worst = 0.0f64;
         let mut best = f64::INFINITY;
         let mut fallbacks = 0u64;
+        // FNV-1a over the result bit patterns, so kernel changes can be checked for bit identity.
+        let mut checksum = 0xcbf2_9ce4_8422_2325u64;
         for it in 0..iters {
             let before = hmm.fallback_pairs();
             let start = Instant::now();
@@ -218,6 +228,7 @@ fn main() {
                 hmm.compute_log10_likelihoods(&reads, &haps, &mut out).unwrap();
                 if it == 0 {
                     for (a, e) in out.iter().zip(&r.expected) {
+                        checksum = (checksum ^ a.to_bits()).wrapping_mul(0x0100_0000_01b3);
                         // GATK writes -Infinity for pairs it discards after the kernel.
                         if e.is_finite() {
                             worst = worst.max((a - e).abs());
@@ -228,18 +239,15 @@ fn main() {
             best = best.min(start.elapsed().as_secs_f64());
             fallbacks = hmm.fallback_pairs() - before;
         }
-        let prec = match precision {
-            Precision::Float => "float",
-            Precision::Double => "double",
-        };
         println!(
-            "{:<8} {:<7} {:>10.1} {:>12.1} {:>12.2e} {:>10}",
+            "{:<8} {:<7} {:>10.1} {:>12.1} {:>12.2e} {:>10} {:>18x}",
             hmm.backend().name(),
-            prec,
+            precision.name(),
             best * 1e3,
             cells as f64 / best / 1e6,
             worst,
-            fallbacks
+            fallbacks,
+            checksum
         );
     }
 }

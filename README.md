@@ -1,6 +1,6 @@
 # fgkl
 
-Native compute kernels for GATK, written in Rust, shipped as one JAR with prebuilt libraries for Linux and macOS on x86_64 and aarch64. A replacement for the archived Intel Genomics Kernel Library (GKL).
+Native compute kernels for GATK, written in Rust, packaged as one JAR for Linux and macOS on x86_64 and aarch64. A replacement for the archived Intel Genomics Kernel Library (GKL). MIT licensed; the reference implementations are ports of GATK code (Apache-2.0), see `NOTICE`.
 
 The project name is a placeholder.
 
@@ -14,15 +14,15 @@ The project name is a placeholder.
 
 ## Layout
 
-- `crates/pairhmm`: the PairHMM and partially determined PairHMM kernels (`fgkl-pairhmm`), scalar reference ports of GATK's algorithms, synthetic data generation, the `pairhmm-bench` and `pdhmm-bench` throughput benchmarks, and `pairhmm-replay`, which replays a GATK `--pair-hmm-results-file` dump.
+- `crates/pairhmm`: the PairHMM and partially determined PairHMM kernels (`fgkl-pairhmm`), scalar reference ports of GATK's algorithms, synthetic data generation, the `pairhmm-bench` and `pdhmm-bench` throughput benchmarks, and `pairhmm-replay` / `pdhmm-replay`, which replay GATK `--pair-hmm-results-file` / `--pdhmm-results-file` dumps. The Rust type is `PdPairHmm` (after GATK's `LoglessPDPairHMM`), the Java class `FgklPdHmm` (after GKL's `IntelPDHMM` and GATK's `pdhmm` package), and the tools `pdhmm-*` (after GATK's flag).
 - `crates/smithwaterman`: the Smith-Waterman aligner (`fgkl-smithwaterman`) with its reference port and `sw-bench`.
 - `crates/jni`: the JNI cdylib (`libfgkl`).
 - `src/main/java`: the Java API and native loader; `src/test/java`: tests against a Java port of the reference.
-- `docs/literature-survey.md`: survey of published PairHMM and Smith-Waterman acceleration work.
+- `docs/pairhmm-design.md`: how the kernels work and why; `docs/gatk-integration.md` and `.patch`: wiring fgkl into GATK; `docs/profiling-2026-09.md`: measurements (references the separate `hc-perf` benchmarking tree); `docs/literature-survey.md`: survey of published PairHMM and Smith-Waterman acceleration work.
 
 ## Building
 
-Requires a Rust toolchain (pinned in `rust-toolchain.toml`) and JDK 17.
+Requires a Rust toolchain (pinned in `rust-toolchain.toml`; minimum 1.89), JDK 17, and for the full gate set `cargo-nextest` and `cargo-deny`.
 
 ```
 cargo test                    # kernel tests
@@ -30,6 +30,6 @@ cargo run --release --bin pairhmm-bench -- --reads 1000 --haps 32
 ./gradlew build               # builds the native library with cargo, then the JAR and Java tests
 ```
 
-`./gradlew build` places the native library under `src/main/resources/native/<os>-<arch>/`. Set `FGKL_PLATFORM` (for example `linux-aarch64`) to cross-compile for another platform with the corresponding Rust target installed. Set the system property `fgkl.library.path` to load a library from a directory instead of the JAR.
+`./gradlew build` builds the native library into `build/native/<os>-<arch>/` and packages it at `native/<os>-<arch>/` in the JAR. The JAR built locally holds the host platform's library only; the multi-platform JAR is assembled from per-platform builds. Set `FGKL_PLATFORM` (for example `linux-aarch64`) to build for another platform with the corresponding Rust target and linker installed. Set the system property `fgkl.library.path` to load a library from a directory instead of the JAR.
 
-Before submitting changes run `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test` and `./gradlew build`.
+Before submitting changes run `cargo ci-fmt`, `cargo ci-lint`, `cargo ci-test`, `cargo ci-doc`, `cargo ci-deny` (aliases in `.cargo/config.toml`) and `./gradlew build`.

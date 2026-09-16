@@ -11,23 +11,27 @@ mod kernel;
 mod model;
 mod pd;
 mod pd_kernel;
-pub mod pdhmm;
+pub mod pd_reference;
 pub mod reference;
 mod simd;
 pub mod synthetic;
 
-pub use pd::{PdHaplotype, PdPairHmm};
+pub use pd::{ALT_A, ALT_C, ALT_G, ALT_T, DEL_END, DEL_START, PdHaplotype, PdPairHmm, SNP};
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kernel::{BatchRunner, Runner, SortedHaps};
+use kernel::SortedHaps;
+
+/// A region's reads left over after its full wide batches use the narrow AVX-512 instantiation
+/// when there are at most this many of them.
+const NARROW_BATCH: usize = 16;
 
 /// One read's bases and per-base penalties, all of the same length.
 #[derive(Clone, Copy, Debug)]
 pub struct ReadRef<'a> {
+    /// Read bases; `N` matches every haplotype base.
     pub bases: &'a [u8],
     /// Phred base qualities.
     pub quals: &'a [u8],
@@ -40,10 +44,12 @@ pub struct ReadRef<'a> {
 }
 
 impl ReadRef<'_> {
+    /// Number of bases.
     pub fn len(&self) -> usize {
         self.bases.len()
     }
 
+    /// Whether the read has no bases.
     pub fn is_empty(&self) -> bool {
         self.bases.is_empty()
     }
@@ -72,14 +78,46 @@ pub enum Precision {
     Double,
 }
 
+impl Precision {
+    /// `"float"` or `"double"`, the spelling `FromStr` accepts.
+    pub fn name(self) -> &'static str {
+        match self {
+            Precision::Float => "float",
+            Precision::Double => "double",
+        }
+    }
+}
+
+impl fmt::Display for Precision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for Precision {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "float" => Ok(Precision::Float),
+            "double" => Ok(Precision::Double),
+            other => Err(format!("unknown precision '{other}' (expected float or double)")),
+        }
+    }
+}
+
 /// The vector instruction set a [`PairHmm`] runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Backend {
+    /// Four scalar lanes, for CPUs without a supported vector unit and for checking the others.
     Scalar,
+    /// Two 128-bit NEON lane groups.
     #[cfg(target_arch = "aarch64")]
     Neon,
+    /// One 256-bit AVX2 lane group with FMA.
     #[cfg(target_arch = "x86_64")]
     Avx2,
+    /// Two 512-bit AVX-512 lane groups, with a single-group instantiation for small batches.
     #[cfg(target_arch = "x86_64")]
     Avx512,
 }
@@ -108,6 +146,7 @@ impl Backend {
         Self::all().iter().copied().filter(|b| b.is_available()).collect()
     }
 
+    /// Whether this CPU can run the backend.
     pub fn is_available(self) -> bool {
         match self {
             Backend::Scalar => true,
@@ -120,6 +159,20 @@ impl Backend {
         }
     }
 
+    /// Whether the kernels have a separate narrow (single lane group) instantiation for this
+    /// backend, used for the reads a region has left over after its full wide batches.
+    pub(crate) fn has_narrow_instantiation(self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self == Backend::Avx512
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
+    /// Lower-case name, the spelling `FromStr` accepts.
     pub fn name(self) -> &'static str {
         match self {
             Backend::Scalar => "scalar",
@@ -154,6 +207,7 @@ impl std::str::FromStr for Backend {
 /// How to build a [`PairHmm`].
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Arithmetic precision; `Float` is GKL's default.
     pub precision: Precision,
     /// `None` selects the fastest available backend.
     pub backend: Option<Backend>,
@@ -172,68 +226,29 @@ impl Default for Config {
 /// A configured PairHMM. Cheap to call repeatedly and safe to share between threads; each call
 /// computes on the calling thread.
 pub struct PairHmm {
-    precision: Precision,
-    backend: Backend,
-    double_fallback: bool,
-    /// Pairs whose single-precision result underflowed, summed over every call.
-    fallback_pairs: AtomicU64,
-}
-
-/// Which kernel instantiation to use: the widest lane group only pays off when a batch can fill it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct RunnerKey {
-    pub backend: Backend,
-    pub precision: Precision,
-    pub wide: bool,
-}
-
-thread_local! {
-    /// Kernel workspaces are reused across calls on the same thread; most assembly regions are
-    /// small enough that allocating them per call would dominate.
-    static RUNNERS: RefCell<Vec<(RunnerKey, Box<dyn BatchRunner>)>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Runs `f` with the cached runner for `key`, creating it on first use.
-fn with_runner<R>(key: RunnerKey, f: impl FnOnce(&mut dyn BatchRunner) -> R) -> R {
-    RUNNERS.with(|cell| {
-        let mut runners = cell.borrow_mut();
-        let index = match runners.iter().position(|(k, _)| *k == key) {
-            Some(i) => i,
-            None => {
-                runners.push((key, make_runner(key)));
-                runners.len() - 1
-            }
-        };
-        f(runners[index].1.as_mut())
-    })
+    inner: Batcher,
 }
 
 impl PairHmm {
+    /// Builds a PairHMM for `config`, failing if the requested backend is unavailable on this CPU.
     pub fn new(config: &Config) -> Result<Self, Error> {
-        let backend = config.backend.unwrap_or_else(Backend::detect);
-        if !backend.is_available() {
-            return Err(Error::BackendUnavailable(backend));
-        }
-        Ok(PairHmm {
-            precision: config.precision,
-            backend,
-            double_fallback: config.double_fallback,
-            fallback_pairs: AtomicU64::new(0),
-        })
+        Ok(PairHmm { inner: Batcher::new(config)? })
     }
 
+    /// The vector instruction set in use.
     pub fn backend(&self) -> Backend {
-        self.backend
+        self.inner.backend
     }
 
+    /// The arithmetic precision in use.
     pub fn precision(&self) -> Precision {
-        self.precision
+        self.inner.precision
     }
 
     /// How many pairs so far underflowed in single precision and were (or, with
     /// `double_fallback` off, would have been) recomputed in double precision.
     pub fn fallback_pairs(&self) -> u64 {
-        self.fallback_pairs.load(Ordering::Relaxed)
+        self.inner.fallback_pairs()
     }
 
     /// Computes every read against every haplotype, writing the log10 likelihood of read `r`
@@ -257,37 +272,114 @@ impl PairHmm {
         if expected == 0 {
             return Ok(());
         }
+        self.inner.compute(reads, &SortedHaps::new(haplotypes), out);
+        Ok(())
+    }
+}
 
-        let haps = SortedHaps::new(haplotypes);
+/// Why a likelihood computation was refused; indices are into the caller's arrays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    /// The read has no bases.
+    EmptyRead(usize),
+    /// The read's qualities or penalties differ in length from its bases.
+    MismatchedReadArrays(usize),
+    /// The haplotype has no bases.
+    EmptyHaplotype(usize),
+    /// A partially determined haplotype's flags differ in length from its bases.
+    MismatchedHaplotypeArrays(usize),
+    /// The output slice does not hold exactly reads x haplotypes elements.
+    OutputLength {
+        /// Reads x haplotypes.
+        expected: usize,
+        /// The slice's length.
+        actual: usize,
+    },
+    /// The requested backend is not supported by this CPU.
+    BackendUnavailable(Backend),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::EmptyRead(i) => write!(f, "read {i} has no bases"),
+            Error::MismatchedReadArrays(i) => {
+                write!(f, "read {i}: bases, qualities and penalties differ in length")
+            }
+            Error::EmptyHaplotype(i) => write!(f, "haplotype {i} has no bases"),
+            Error::MismatchedHaplotypeArrays(i) => {
+                write!(f, "haplotype {i}: bases and flags differ in length")
+            }
+            Error::OutputLength { expected, actual } => {
+                write!(f, "output has {actual} elements but reads x haplotypes is {expected}")
+            }
+            Error::BackendUnavailable(b) => write!(f, "backend {b} is not supported by this CPU"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// The batching driver shared by [`PairHmm`] and [`PdPairHmm`]: fills the kernel's lanes with
+/// reads, recomputes underflowing pairs in double precision, and maps results back to the
+/// caller's haplotype order. What differs between the two kernels lives behind [`HapSet`].
+pub(crate) struct Batcher {
+    precision: Precision,
+    backend: Backend,
+    double_fallback: bool,
+    /// Pairs whose single-precision result underflowed, summed over every call.
+    fallback_pairs: AtomicU64,
+}
+
+impl Batcher {
+    pub fn new(config: &Config) -> Result<Self, Error> {
+        let backend = config.backend.unwrap_or_else(Backend::detect);
+        if !backend.is_available() {
+            return Err(Error::BackendUnavailable(backend));
+        }
+        Ok(Batcher {
+            precision: config.precision,
+            backend,
+            double_fallback: config.double_fallback,
+            fallback_pairs: AtomicU64::new(0),
+        })
+    }
+
+    pub fn fallback_pairs(&self) -> u64 {
+        self.fallback_pairs.load(Ordering::Relaxed)
+    }
+
+    /// Computes every read against every haplotype of `haps` (validated and non-empty), writing
+    /// `out[read * haps.len() + hap]` in the caller's haplotype order.
+    pub fn compute<H: HapSet>(&self, reads: &[ReadRef<'_>], haps: &H, out: &mut [f64]) {
         let n_haps = haps.len();
         // Longest reads first so that the lanes of a batch have similar lengths.
         let mut read_order: Vec<usize> = (0..reads.len()).collect();
         read_order.sort_by_key(|&i| std::cmp::Reverse(reads[i].len()));
         let sorted_reads: Vec<ReadRef<'_>> = read_order.iter().map(|&i| reads[i]).collect();
 
-        let mut tmp = vec![0.0f64; expected];
-        let fallback = self.run_pass(self.precision, &sorted_reads, &haps, &mut tmp);
+        let mut tmp = vec![0.0f64; reads.len() * n_haps];
+        let fallback = self.run_pass(self.precision, &sorted_reads, haps, &mut tmp);
         if !fallback.is_empty() {
             self.fallback_pairs.fetch_add(fallback.len() as u64, Ordering::Relaxed);
             if self.double_fallback {
-                self.run_fallback(&fallback, &sorted_reads, &haps, &mut tmp);
+                self.run_fallback(&fallback, &sorted_reads, haps, &mut tmp);
             }
         }
         for (pos, &read) in read_order.iter().enumerate() {
-            for (k, &hap) in haps.order.iter().enumerate() {
+            for (k, &hap) in haps.order().iter().enumerate() {
                 out[read * n_haps + hap] = tmp[pos * n_haps + k];
             }
         }
-        Ok(())
     }
 
     /// Runs every batch of reads against all haplotypes, returning the `(read, sorted
     /// haplotype)` pairs whose result must be recomputed in double precision.
-    fn run_pass(
+    fn run_pass<H: HapSet>(
         &self,
         precision: Precision,
         reads: &[ReadRef<'_>],
-        haps: &SortedHaps<'_>,
+        haps: &H,
         tmp: &mut [f64],
     ) -> Vec<(usize, usize)> {
         let wide = RunnerKey { backend: self.backend, precision, wide: true };
@@ -295,9 +387,8 @@ impl PairHmm {
         // Full batches run on the wide instantiation; a remainder the narrow one can hold runs
         // there rather than leaving half the wide lanes empty. Only AVX-512 has both.
         let n = reads.len();
-        let split = if has_narrow_instantiation(self.backend) {
-            let wide_lanes = with_runner(wide, |runner| runner.lanes());
-            let rest = n % wide_lanes;
+        let split = if self.backend.has_narrow_instantiation() {
+            let rest = n % H::lanes(wide);
             if rest <= NARROW_BATCH { n - rest } else { n }
         } else {
             n
@@ -311,10 +402,10 @@ impl PairHmm {
 
     /// Runs `reads` in batches of the runner's lane count, recording fallback pairs with their
     /// read index offset by `first_read`.
-    fn run_batches(
+    fn run_batches<H: HapSet>(
         key: RunnerKey,
         reads: &[ReadRef<'_>],
-        haps: &SortedHaps<'_>,
+        haps: &H,
         tmp: &mut [f64],
         first_read: usize,
         fallback: &mut Vec<(usize, usize)>,
@@ -322,29 +413,27 @@ impl PairHmm {
         if reads.is_empty() {
             return;
         }
-        with_runner(key, |runner| {
-            let lanes = runner.lanes();
-            let n_haps = haps.len();
-            let mut batch = Vec::new();
-            for (b, out) in tmp.chunks_mut(lanes * n_haps).enumerate() {
-                let lo = b * lanes;
-                let hi = (lo + lanes).min(reads.len());
-                batch.clear();
-                runner.run(&reads[lo..hi], haps, out, &mut batch);
-                fallback.extend(batch.iter().map(|&(r, h)| (first_read + lo + r, h)));
-            }
-        })
+        let lanes = H::lanes(key);
+        let n_haps = haps.len();
+        let mut batch = Vec::new();
+        for (b, out) in tmp.chunks_mut(lanes * n_haps).enumerate() {
+            let lo = b * lanes;
+            let hi = (lo + lanes).min(reads.len());
+            batch.clear();
+            haps.run_batch(key, &reads[lo..hi], out, &mut batch);
+            fallback.extend(batch.iter().map(|&(r, h)| (first_read + lo + r, h)));
+        }
     }
 
     /// Recomputes the given `(read, sorted haplotype)` pairs in double precision. A read that
     /// underflowed against a third or more of the haplotypes is run against all of them in one
     /// prefix-shared sweep, which is cheaper than an unshared sweep per haplotype; the other
     /// pairs are grouped by haplotype and run one haplotype at a time.
-    fn run_fallback(
+    fn run_fallback<H: HapSet>(
         &self,
         pairs: &[(usize, usize)],
         reads: &[ReadRef<'_>],
-        haps: &SortedHaps<'_>,
+        haps: &H,
         tmp: &mut [f64],
     ) {
         let n_haps = haps.len();
@@ -375,103 +464,50 @@ impl PairHmm {
             }
         }
         let key = RunnerKey { backend: self.backend, precision: Precision::Double, wide: false };
-        with_runner(key, |runner| {
-            let lanes = runner.lanes();
-            let mut out = vec![0.0f64; lanes];
-            let mut none = Vec::new();
-            for (h, read_positions) in by_hap {
-                let single = SortedHaps::new(&[haps.bases[h]]);
-                for chunk in read_positions.chunks(lanes) {
-                    let batch: Vec<ReadRef<'_>> = chunk.iter().map(|&p| reads[p]).collect();
-                    runner.run(&batch, &single, &mut out[..batch.len()], &mut none);
-                    for (i, &p) in chunk.iter().enumerate() {
-                        tmp[p * n_haps + h] = out[i];
-                    }
+        let lanes = H::lanes(key);
+        let mut out = vec![0.0f64; lanes];
+        let mut none = Vec::new();
+        for (h, read_positions) in by_hap {
+            let single = haps.single(h);
+            for chunk in read_positions.chunks(lanes) {
+                let batch: Vec<ReadRef<'_>> = chunk.iter().map(|&p| reads[p]).collect();
+                single.run_batch(key, &batch, &mut out[..batch.len()], &mut none);
+                for (i, &p) in chunk.iter().enumerate() {
+                    tmp[p * n_haps + h] = out[i];
                 }
             }
-            debug_assert!(none.is_empty(), "double precision never falls back");
-        });
-    }
-}
-
-/// A region's reads left over after its full wide batches use the narrow AVX-512 instantiation
-/// when there are at most this many of them.
-pub(crate) const NARROW_BATCH: usize = 16;
-
-/// Whether the AVX-512 kernels have a separate narrow instantiation for this backend.
-pub(crate) fn has_narrow_instantiation(backend: Backend) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        backend == Backend::Avx512
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = backend;
-        false
-    }
-}
-
-fn make_runner(key: RunnerKey) -> Box<dyn BatchRunner> {
-    use simd::{ScalarF32, ScalarF64};
-    #[cfg(target_arch = "x86_64")]
-    if key.backend == Backend::Avx512 && !key.wide {
-        return match key.precision {
-            Precision::Float => Box::new(Runner::<simd::x86::Avx512F32Narrow>::new()),
-            Precision::Double => Box::new(Runner::<simd::x86::Avx512F64Narrow>::new()),
-        };
-    }
-    match (key.backend, key.precision) {
-        (Backend::Scalar, Precision::Float) => Box::new(Runner::<ScalarF32>::new()),
-        (Backend::Scalar, Precision::Double) => Box::new(Runner::<ScalarF64>::new()),
-        #[cfg(target_arch = "aarch64")]
-        (Backend::Neon, Precision::Float) => Box::new(Runner::<simd::neon::NeonF32>::new()),
-        #[cfg(target_arch = "aarch64")]
-        (Backend::Neon, Precision::Double) => Box::new(Runner::<simd::neon::NeonF64>::new()),
-        #[cfg(target_arch = "x86_64")]
-        (Backend::Avx2, Precision::Float) => Box::new(Runner::<simd::x86::Avx2F32>::new()),
-        #[cfg(target_arch = "x86_64")]
-        (Backend::Avx2, Precision::Double) => Box::new(Runner::<simd::x86::Avx2F64>::new()),
-        #[cfg(target_arch = "x86_64")]
-        (Backend::Avx512, Precision::Float) => Box::new(Runner::<simd::x86::Avx512F32>::new()),
-        #[cfg(target_arch = "x86_64")]
-        (Backend::Avx512, Precision::Double) => Box::new(Runner::<simd::x86::Avx512F64>::new()),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Error {
-    EmptyRead(usize),
-    MismatchedReadArrays(usize),
-    EmptyHaplotype(usize),
-    /// A partially determined haplotype's flags differ in length from its bases.
-    MismatchedHaplotypeArrays(usize),
-    OutputLength {
-        expected: usize,
-        actual: usize,
-    },
-    BackendUnavailable(Backend),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::EmptyRead(i) => write!(f, "read {i} has no bases"),
-            Error::MismatchedReadArrays(i) => {
-                write!(f, "read {i}: bases, qualities and penalties differ in length")
-            }
-            Error::EmptyHaplotype(i) => write!(f, "haplotype {i} has no bases"),
-            Error::MismatchedHaplotypeArrays(i) => {
-                write!(f, "haplotype {i}: bases and flags differ in length")
-            }
-            Error::OutputLength { expected, actual } => {
-                write!(f, "output has {actual} elements but reads x haplotypes is {expected}")
-            }
-            Error::BackendUnavailable(b) => write!(f, "backend {b} is not supported by this CPU"),
         }
+        debug_assert!(none.is_empty(), "double precision never falls back");
     }
 }
 
-impl std::error::Error for Error {}
+/// A sorted haplotype set a kernel can run, with its own per-thread runner cache.
+pub(crate) trait HapSet: Sized {
+    fn len(&self) -> usize;
+    /// `order()[k]` is the caller's index of sorted haplotype `k`.
+    fn order(&self) -> &[usize];
+    /// The set holding only sorted haplotype `k`, for per-haplotype double recomputation.
+    fn single(&self, k: usize) -> Self;
+    /// Lane count of the kernel instantiation `key` selects.
+    fn lanes(key: RunnerKey) -> usize;
+    /// Runs at most `lanes(key)` reads against every haplotype on this thread's cached runner;
+    /// see `BatchRunner::run` for the output layout.
+    fn run_batch(
+        &self,
+        key: RunnerKey,
+        reads: &[ReadRef<'_>],
+        out: &mut [f64],
+        fallback: &mut Vec<(usize, usize)>,
+    );
+}
+
+/// Which kernel instantiation to use: the widest lane group only pays off when a batch can fill it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct RunnerKey {
+    pub backend: Backend,
+    pub precision: Precision,
+    pub wide: bool,
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,10 +1,10 @@
-//! A line-by-line port of GATK's `SmithWatermanJavaAligner`, with full integer score and
-//! traceback matrices; the oracle for [`crate::Aligner`].
+//! A line-by-line port of GATK's `SmithWatermanJavaAligner` (Broad Institute, Apache-2.0; see
+//! NOTICE), with full integer score and traceback matrices; the oracle for [`crate::Aligner`].
 
-use crate::{Alignment, CigarElement, CigarOp, OverhangStrategy, SwParameters, last_index_of};
-
-const MATRIX_MIN_CUTOFF: i32 = -100_000_000;
-const LOW_INIT_VALUE: i32 = i32::MIN / 2;
+use crate::{
+    Alignment, CigarElement, CigarOp, LOW_INIT_VALUE, MATRIX_MIN_CUTOFF, OverhangStrategy,
+    SwParameters, last_index_of,
+};
 
 /// Aligns `alternate` to `reference`; both must be non-empty.
 pub fn align(
@@ -180,16 +180,15 @@ fn calculate_cigar(
             break;
         }
     }
-    let alignment_offset;
-    if strategy == OverhangStrategy::SoftClip {
+    let alignment_offset = if strategy == OverhangStrategy::SoftClip {
         lce.push(CigarElement { len: segment_length as u32, op: state });
         if p2 > 0 {
             lce.push(CigarElement { len: p2 as u32, op: CigarOp::S });
         }
-        alignment_offset = p1 as i32;
+        p1 as i32
     } else if strategy == OverhangStrategy::Ignore {
         lce.push(CigarElement { len: (segment_length + p2) as u32, op: state });
-        alignment_offset = p1 as i32 - p2 as i32;
+        p1 as i32 - p2 as i32
     } else {
         lce.push(CigarElement { len: segment_length as u32, op: state });
         if p1 > 0 {
@@ -197,8 +196,8 @@ fn calculate_cigar(
         } else if p2 > 0 {
             lce.push(CigarElement { len: p2 as u32, op: CigarOp::I });
         }
-        alignment_offset = 0;
-    }
+        0
+    };
     lce.reverse();
     Alignment { cigar: lce, offset: alignment_offset }
 }

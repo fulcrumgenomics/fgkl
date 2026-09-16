@@ -54,6 +54,8 @@ Kernel results agree with GATK's recorded values to 5e-5 (the dump's `%e` precis
 
 ## 4. Precision policy: what each option is worth
 
+(The per-row rescaling recommended here was implemented and rejected; see section 7.)
+
 The cost of the fallback path is the point. A fallback pair costs 33 µs on the centromere and 93 µs on norm8 against 3-4 µs for a pair in the main pass, because the recomputation runs one haplotype at a time with mostly empty lanes and rebuilds the per-haplotype tables (and, in v6, cleared 14 MB per batch). That is why 0.4% of pairs cost 11% of norm8 time and 4% of pairs cost 33% of centromere time, and why in HaplotypeCaller double beat float on 0093 and 0122 with v6: not because float is slow there, but because the fallback path was. The HaplotypeCaller-level A/B of the no-fill build (v7) on the same instance confirms it:
 
 | shard | v6 float | v7 float | v6 double | v7 double | GKL 4 threads |

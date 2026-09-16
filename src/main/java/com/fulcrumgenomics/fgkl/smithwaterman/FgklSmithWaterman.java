@@ -37,7 +37,7 @@ public final class FgklSmithWaterman implements SWAlignerNativeBinding {
             throw new IllegalArgumentException("Cannot align empty sequences");
         }
         int[] offset = new int[1];
-        String cigar = alignNative(reference, alternate, parameters.getMatchValue(), parameters.getMismatchPenalty(), parameters.getGapOpenPenalty(), parameters.getGapExtendPenalty(), overhangStrategy.ordinal(), offset);
+        String cigar = alignNative(reference, alternate, parameters.getMatchValue(), parameters.getMismatchPenalty(), parameters.getGapOpenPenalty(), parameters.getGapExtendPenalty(), strategyCode(overhangStrategy), offset);
         return new SWNativeAlignerResult(cigar, offset[0]);
     }
 
@@ -46,7 +46,18 @@ public final class FgklSmithWaterman implements SWAlignerNativeBinding {
 
     /**
      * Returns the CIGAR string and stores the alignment offset in {@code offset[0]}. The strategy
-     * is the ordinal of {@link SWOverhangStrategy}: SOFTCLIP, INDEL, LEADING_INDEL, IGNORE.
+     * is the code {@link #strategyCode} assigns: 0 SOFTCLIP, 1 INDEL, 2 LEADING_INDEL, 3 IGNORE.
      */
+    /** Maps the strategy to the code the native side expects, independent of the enum's ordinal order. */
+    static int strategyCode(SWOverhangStrategy strategy) {
+        switch (strategy) {
+            case SOFTCLIP: return 0;
+            case INDEL: return 1;
+            case LEADING_INDEL: return 2;
+            case IGNORE: return 3;
+            default: throw new IllegalArgumentException("Unknown overhang strategy " + strategy);
+        }
+    }
+
     private static native String alignNative(byte[] reference, byte[] alternate, int match, int mismatch, int gapOpen, int gapExtend, int strategy, int[] offset);
 }

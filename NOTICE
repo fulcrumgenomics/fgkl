@@ -1,0 +1,14 @@
+fgkl
+Copyright (c) 2026 Fulcrum Genomics LLC
+
+This product includes software derived from the Genome Analysis Toolkit (GATK),
+Copyright 2021 Broad Institute, Inc., licensed under the Apache License, Version 2.0
+(https://github.com/broadinstitute/gatk/blob/master/LICENSE.TXT). The scalar reference
+implementations in crates/pairhmm/src/reference.rs, crates/pairhmm/src/pd_reference.rs,
+crates/smithwaterman/src/reference.rs and the Java test references under src/test/java are
+line-by-line ports of GATK's LoglessPairHMM, LoglessPDPairHMM and SmithWatermanJavaAligner, and
+the probability tables in crates/pairhmm/src/model.rs reproduce GATK's PairHMMModel and
+QualityUtils. The behaviour of the vectorized kernels is specified by those classes.
+
+The Java API implements the interfaces of gatk-native-bindings (org.broadinstitute), also
+Apache License, Version 2.0.

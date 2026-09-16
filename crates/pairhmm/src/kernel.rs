@@ -9,12 +9,14 @@
 //! to `INITIAL / haplotype_length`, a snapshot taken for one haplotype length is rescaled by the
 //! ratio of lengths when reused for another.
 
-use crate::ReadRef;
+use std::cell::RefCell;
+
 use crate::model::{
     DELETION_TO_DELETION, INDEL_TO_MATCH, INSERTION_TO_INSERTION, MATCH_TO_DELETION,
     MATCH_TO_INSERTION, MATCH_TO_MATCH, NUM_TRANSITIONS, TABLES,
 };
-use crate::simd::{AlignedVec, Float, Simd};
+use crate::simd::{self, AlignedVec, Float, Simd, with_flush_to_zero};
+use crate::{Backend, HapSet, Precision, ReadRef, RunnerKey};
 
 /// Prior tables always cover these bases; any other byte occurring in a haplotype gets its own.
 const STANDARD_BASES: [u8; 5] = *b"ACGTN";
@@ -85,6 +87,82 @@ impl<'a> SortedHaps<'a> {
     }
 }
 
+impl HapSet for SortedHaps<'_> {
+    fn len(&self) -> usize {
+        self.bases.len()
+    }
+
+    fn order(&self) -> &[usize] {
+        &self.order
+    }
+
+    fn single(&self, k: usize) -> Self {
+        SortedHaps::new(&[self.bases[k]])
+    }
+
+    fn lanes(key: RunnerKey) -> usize {
+        with_runner(key, |runner| runner.lanes())
+    }
+
+    fn run_batch(
+        &self,
+        key: RunnerKey,
+        reads: &[ReadRef<'_>],
+        out: &mut [f64],
+        fallback: &mut Vec<(usize, usize)>,
+    ) {
+        with_runner(key, |runner| runner.run(reads, self, out, fallback))
+    }
+}
+
+thread_local! {
+    /// Kernel workspaces are reused across calls on the same thread; most assembly regions are
+    /// small enough that allocating them per call would dominate.
+    static RUNNERS: RefCell<Vec<(RunnerKey, Box<dyn BatchRunner>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` with this thread's cached runner for `key`, creating it on first use.
+fn with_runner<R>(key: RunnerKey, f: impl FnOnce(&mut dyn BatchRunner) -> R) -> R {
+    RUNNERS.with(|cell| {
+        let mut runners = cell.borrow_mut();
+        let index = match runners.iter().position(|(k, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                runners.push((key, make_runner(key)));
+                runners.len() - 1
+            }
+        };
+        f(runners[index].1.as_mut())
+    })
+}
+
+fn make_runner(key: RunnerKey) -> Box<dyn BatchRunner> {
+    use simd::{ScalarF32, ScalarF64};
+    #[cfg(target_arch = "x86_64")]
+    if key.backend == Backend::Avx512 && !key.wide {
+        return match key.precision {
+            Precision::Float => Box::new(Runner::<simd::x86::Avx512F32Narrow>::new()),
+            Precision::Double => Box::new(Runner::<simd::x86::Avx512F64Narrow>::new()),
+        };
+    }
+    match (key.backend, key.precision) {
+        (Backend::Scalar, Precision::Float) => Box::new(Runner::<ScalarF32>::new()),
+        (Backend::Scalar, Precision::Double) => Box::new(Runner::<ScalarF64>::new()),
+        #[cfg(target_arch = "aarch64")]
+        (Backend::Neon, Precision::Float) => Box::new(Runner::<simd::neon::NeonF32>::new()),
+        #[cfg(target_arch = "aarch64")]
+        (Backend::Neon, Precision::Double) => Box::new(Runner::<simd::neon::NeonF64>::new()),
+        #[cfg(target_arch = "x86_64")]
+        (Backend::Avx2, Precision::Float) => Box::new(Runner::<simd::x86::Avx2F32>::new()),
+        #[cfg(target_arch = "x86_64")]
+        (Backend::Avx2, Precision::Double) => Box::new(Runner::<simd::x86::Avx2F64>::new()),
+        #[cfg(target_arch = "x86_64")]
+        (Backend::Avx512, Precision::Float) => Box::new(Runner::<simd::x86::Avx512F32>::new()),
+        #[cfg(target_arch = "x86_64")]
+        (Backend::Avx512, Precision::Double) => Box::new(Runner::<simd::x86::Avx512F64>::new()),
+    }
+}
+
 /// A kernel instantiated for one backend and precision, with its scratch memory.
 pub(crate) trait BatchRunner: Send {
     fn lanes(&self) -> usize;
@@ -134,18 +212,8 @@ impl<S: Simd> Runner<S> {
                 }
             }
             ws.run_hap(start, hap_len, &haps.codes[k]);
-            for (lane, _) in reads.iter().enumerate() {
-                let raw = ws.acc[lane].to_f64();
-                let lost = match S::Elem::MIN_ACCEPTED {
-                    Some(threshold) => raw.is_nan() || raw < threshold,
-                    None => false,
-                };
-                out[lane * n_haps + k] = if lost {
-                    fallback.push((lane, k));
-                    f64::NAN
-                } else {
-                    raw.log10() - S::Elem::log10_initial_constant()
-                };
+            for lane in 0..reads.len() {
+                out[lane * n_haps + k] = finish_lane::<S::Elem>(ws.acc[lane], lane, k, fallback);
             }
         }
     }
@@ -196,34 +264,6 @@ macro_rules! runner_impl {
             }
         }
     };
-}
-
-/// Runs `f` with x86 flush-to-zero and denormals-are-zero set, restoring the caller's MXCSR
-/// afterwards. Single-precision DP values routinely fall into the subnormal range, where x86
-/// arithmetic takes microcode assists costing over a hundred cycles per operation; flushing them
-/// to zero costs nothing numerically because any pair whose result is that small is recomputed
-/// in double precision anyway. GKL enables the same mode.
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn with_flush_to_zero<R>(f: impl FnOnce() -> R) -> R {
-    const FTZ_DAZ: u32 = 0x8040;
-    let mut saved: u32 = 0;
-    // SAFETY: stmxcsr/ldmxcsr only read and write the MXCSR register through a valid u32.
-    unsafe {
-        core::arch::asm!("stmxcsr [{}]", in(reg) &mut saved, options(nostack, preserves_flags))
-    };
-    let flushed = saved | FTZ_DAZ;
-    unsafe {
-        core::arch::asm!("ldmxcsr [{}]", in(reg) &flushed, options(nostack, preserves_flags))
-    };
-    let result = f();
-    unsafe { core::arch::asm!("ldmxcsr [{}]", in(reg) &saved, options(nostack, preserves_flags)) };
-    result
-}
-
-/// Subnormals cost nothing extra on aarch64, so nothing to do.
-#[cfg(not(target_arch = "x86_64"))]
-pub(crate) fn with_flush_to_zero<R>(f: impl FnOnce() -> R) -> R {
-    f()
 }
 
 runner_impl!(crate::simd::ScalarF32);
@@ -452,15 +492,7 @@ impl<S: Simd> Workspace<S> {
 
         for i in 1..=rows {
             let r = i - 1;
-            let tb = r * NUM_TRANSITIONS * lanes;
-            let t = Transitions {
-                mm: S::load(&trans[tb + MATCH_TO_MATCH * lanes..]),
-                im: S::load(&trans[tb + INDEL_TO_MATCH * lanes..]),
-                mi: S::load(&trans[tb + MATCH_TO_INSERTION * lanes..]),
-                ii: S::load(&trans[tb + INSERTION_TO_INSERTION * lanes..]),
-                md: S::load(&trans[tb + MATCH_TO_DELETION * lanes..]),
-                dd: S::load(&trans[tb + DELETION_TO_DELETION * lanes..]),
-            };
+            let t = Transitions::<S>::load(trans, r);
             let prior_row = &prior[r * num_codes * lanes..(r + 1) * num_codes * lanes];
             let mut state = CellState {
                 m_diag: S::load(&src_m[(i - 1) * lanes..]).mul(scale),
@@ -543,27 +575,66 @@ struct RowViewMut<'a, E> {
     y: &'a mut [E],
 }
 
+/// Converts a lane's raw scaled probability for sorted haplotype `k` into a log10 likelihood,
+/// or records the pair in `fallback` and yields `NaN` when single precision lost it.
+#[inline(always)]
+pub(crate) fn finish_lane<E: Float>(
+    raw: E,
+    lane: usize,
+    k: usize,
+    fallback: &mut Vec<(usize, usize)>,
+) -> f64 {
+    let raw = raw.to_f64();
+    let lost = match E::MIN_ACCEPTED {
+        Some(threshold) => raw.is_nan() || raw < threshold,
+        None => false,
+    };
+    if lost {
+        fallback.push((lane, k));
+        f64::NAN
+    } else {
+        raw.log10() - E::log10_initial_constant()
+    }
+}
+
 /// The six transition probabilities of one read position, one vector each.
 #[derive(Clone, Copy)]
-struct Transitions<S> {
-    mm: S,
-    im: S,
-    mi: S,
-    ii: S,
-    md: S,
-    dd: S,
+pub(crate) struct Transitions<S> {
+    pub mm: S,
+    pub im: S,
+    pub mi: S,
+    pub ii: S,
+    pub md: S,
+    pub dd: S,
+}
+
+impl<S: Simd> Transitions<S> {
+    /// Loads read row `r` from a `[row][transition][lane]` table.
+    #[inline(always)]
+    pub(crate) fn load(trans: &[S::Elem], r: usize) -> Self {
+        let lanes = S::LANES;
+        let tb = r * NUM_TRANSITIONS * lanes;
+        Transitions {
+            mm: S::load(&trans[tb + MATCH_TO_MATCH * lanes..]),
+            im: S::load(&trans[tb + INDEL_TO_MATCH * lanes..]),
+            mi: S::load(&trans[tb + MATCH_TO_INSERTION * lanes..]),
+            ii: S::load(&trans[tb + INSERTION_TO_INSERTION * lanes..]),
+            md: S::load(&trans[tb + MATCH_TO_DELETION * lanes..]),
+            dd: S::load(&trans[tb + DELETION_TO_DELETION * lanes..]),
+        }
+    }
 }
 
 /// The neighbours of the next cell in a row sweep: the previous row's values one column back and
 /// the current row's values one column back.
 #[derive(Clone, Copy)]
-struct CellState<S> {
-    m_diag: S,
-    x_diag: S,
-    y_diag: S,
-    m_left: S,
-    x_left: S,
-    y_left: S,
+pub(crate) struct CellState<S> {
+    pub m_diag: S,
+    pub x_diag: S,
+    pub y_diag: S,
+    pub m_left: S,
+    pub x_left: S,
+    pub y_left: S,
 }
 
 /// Computes columns `lo+1..=hi` of the current row. With `ACC` set, also sums match plus insertion

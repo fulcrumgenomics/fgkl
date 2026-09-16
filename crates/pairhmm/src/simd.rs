@@ -179,6 +179,44 @@ pub trait Simd: Copy + Send + Sync + 'static {
     }
 }
 
+/// Runs `f` with x86 flush-to-zero and denormals-are-zero set, restoring the caller's MXCSR
+/// afterwards. Single-precision DP values routinely fall into the subnormal range, where x86
+/// arithmetic takes microcode assists costing over a hundred cycles per operation; flushing them
+/// to zero costs nothing numerically because any pair whose result is that small is recomputed
+/// in double precision anyway. GKL enables the same mode.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn with_flush_to_zero<R>(f: impl FnOnce() -> R) -> R {
+    /// Restores the saved MXCSR when dropped, so a panic unwinding out of `f` (caught by the JNI
+    /// layer) does not leave the JVM thread flushing subnormals.
+    struct Restore(u32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: ldmxcsr only writes the MXCSR register from a valid u32.
+            unsafe {
+                core::arch::asm!("ldmxcsr [{}]", in(reg) &self.0, options(nostack, preserves_flags))
+            };
+        }
+    }
+    const FTZ_DAZ: u32 = 0x8040;
+    let mut saved: u32 = 0;
+    // SAFETY: stmxcsr/ldmxcsr only read and write the MXCSR register through a valid u32.
+    unsafe {
+        core::arch::asm!("stmxcsr [{}]", in(reg) &mut saved, options(nostack, preserves_flags))
+    };
+    let _restore = Restore(saved);
+    let flushed = saved | FTZ_DAZ;
+    unsafe {
+        core::arch::asm!("ldmxcsr [{}]", in(reg) &flushed, options(nostack, preserves_flags))
+    };
+    f()
+}
+
+/// Subnormals cost nothing extra on aarch64, so nothing to do.
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn with_flush_to_zero<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 /// One lane, for CPUs without a supported vector unit and for checking the vector backends.
 #[derive(Clone, Copy)]
 pub struct Scalar<T>(pub T);

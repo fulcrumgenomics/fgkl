@@ -3,7 +3,7 @@
 //! then the deletion, and GATK's four overhang strategies for choosing where the alignment ends
 //! and how unaligned sequence is reported.
 //!
-//! [`reference`] is a line-by-line port kept as the oracle; [`Aligner`] produces identical
+//! [`mod@reference`] is a line-by-line port kept as the oracle; [`Aligner`] produces identical
 //! alignments with two score rows, reusable buffers, and one byte of traceback per cell. The SIMD
 //! backends fill the matrix anti-diagonal by anti-diagonal in 16-bit lanes first and redo the rare
 //! pair whose scores saturate them in 32-bit lanes (see `diag`).
@@ -21,6 +21,9 @@ const MATRIX_MIN_CUTOFF: i32 = -100_000_000;
 /// GATK's `lowInitValue` for gap scores before any gap has been opened.
 const LOW_INIT_VALUE: i32 = i32::MIN / 2;
 
+/// A vector kernel instantiation, absent where the backend has none of that lane width.
+type Fill = Option<Box<dyn DiagFill>>;
+
 /// Traceback flags, one byte per cell.
 const DIR_MASK: u8 = 0b11;
 const DIR_DIAG: u8 = 0;
@@ -34,13 +37,18 @@ const INSERTION_EXTENDS: u8 = 0b1000;
 /// Scoring parameters as GATK's `SWParameters`: a positive match value and negative penalties.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SwParameters {
+    /// Score of a matching base pair (positive).
     pub match_value: i32,
+    /// Score of a mismatching base pair (negative).
     pub mismatch_penalty: i32,
+    /// Score of opening a gap (negative).
     pub gap_open_penalty: i32,
+    /// Score of extending a gap by one base (negative).
     pub gap_extend_penalty: i32,
 }
 
 impl SwParameters {
+    /// Parameters in GATK's argument order.
     pub const fn new(
         match_value: i32,
         mismatch_penalty: i32,
@@ -64,15 +72,21 @@ pub enum OverhangStrategy {
     Ignore,
 }
 
+/// The CIGAR operations an alignment can contain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CigarOp {
+    /// Alignment match (base match or mismatch).
     M,
+    /// Insertion to the reference.
     I,
+    /// Deletion from the reference.
     D,
+    /// Soft clip.
     S,
 }
 
 impl CigarOp {
+    /// The operation's letter in a CIGAR string.
     pub fn letter(self) -> char {
         match self {
             CigarOp::M => 'M',
@@ -83,9 +97,12 @@ impl CigarOp {
     }
 }
 
+/// One run of a CIGAR operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CigarElement {
+    /// Run length.
     pub len: u32,
+    /// The operation.
     pub op: CigarOp,
 }
 
@@ -93,11 +110,14 @@ pub struct CigarElement {
 /// reference offset of its first aligned base (GATK's `alignmentOffset`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Alignment {
+    /// The CIGAR, in alternate-sequence order.
     pub cigar: Vec<CigarElement>,
+    /// Reference offset of the first aligned base.
     pub offset: i32,
 }
 
 impl Alignment {
+    /// The CIGAR as text, e.g. `3S10M1D5M`.
     pub fn cigar_string(&self) -> String {
         let mut s = String::with_capacity(self.cigar.len() * 4);
         for e in &self.cigar {
@@ -114,15 +134,20 @@ impl fmt::Display for Alignment {
     }
 }
 
+/// Why an alignment was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// The reference or the alternate has no bases.
     EmptySequence,
+    /// The requested backend is not supported by this CPU.
+    BackendUnavailable(Backend),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::EmptySequence => f.write_str("sequences must be non-empty"),
+            Error::BackendUnavailable(b) => write!(f, "backend {b} is not supported by this CPU"),
         }
     }
 }
@@ -134,10 +159,13 @@ impl std::error::Error for Error {}
 pub enum Backend {
     /// Row by row without vector instructions.
     Scalar,
+    /// 128-bit NEON lanes.
     #[cfg(target_arch = "aarch64")]
     Neon,
+    /// 256-bit AVX2 lanes.
     #[cfg(target_arch = "x86_64")]
     Avx2,
+    /// 512-bit AVX-512 lanes (requires AVX-512BW for the 16-bit kernel).
     #[cfg(target_arch = "x86_64")]
     Avx512,
 }
@@ -161,10 +189,12 @@ impl Backend {
         ]
     }
 
+    /// The backends this CPU supports, slowest first.
     pub fn available() -> Vec<Backend> {
         Self::all().iter().copied().filter(|b| b.is_available()).collect()
     }
 
+    /// Whether this CPU can run the backend.
     pub fn is_available(self) -> bool {
         match self {
             Backend::Scalar => true,
@@ -179,6 +209,7 @@ impl Backend {
         }
     }
 
+    /// Lower-case name, the spelling `FromStr` accepts.
     pub fn name(self) -> &'static str {
         match self {
             Backend::Scalar => "scalar",
@@ -192,8 +223,7 @@ impl Backend {
     }
 
     /// The 16-bit and 32-bit lane workspaces of this backend; none for the scalar backend.
-    #[allow(clippy::type_complexity)]
-    fn make_fills(self) -> (Option<Box<dyn DiagFill>>, Option<Box<dyn DiagFill>>) {
+    fn make_fills(self) -> (Fill, Fill) {
         match self {
             Backend::Scalar => (None, None),
             #[cfg(target_arch = "aarch64")]
@@ -226,9 +256,9 @@ impl fmt::Display for Backend {
 pub struct Aligner {
     backend: Backend,
     /// The 16-bit-lane fill, tried first; absent on the scalar backend or when disabled.
-    narrow: Option<Box<dyn DiagFill>>,
+    narrow: Fill,
     /// The 32-bit-lane fill, used when the narrow one saturates.
-    wide: Option<Box<dyn DiagFill>>,
+    wide: Fill,
     narrow_fallbacks: u64,
     h_prev: Vec<i32>,
     h_cur: Vec<i32>,
@@ -239,23 +269,19 @@ pub struct Aligner {
     trace: Vec<u8>,
 }
 
-impl Default for Aligner {
-    fn default() -> Self {
-        Aligner::new()
-    }
-}
-
 impl Aligner {
     /// An aligner on the fastest backend this CPU supports.
     pub fn new() -> Self {
-        Aligner::with_backend(Backend::detect())
+        Aligner::with_backend(Backend::detect()).expect("the detected backend is available")
     }
 
-    /// An aligner on a specific backend, which must be available on this CPU.
-    pub fn with_backend(backend: Backend) -> Self {
-        assert!(backend.is_available(), "backend {backend} is not supported by this CPU");
+    /// An aligner on a specific backend, failing if this CPU cannot run it.
+    pub fn with_backend(backend: Backend) -> Result<Self, Error> {
+        if !backend.is_available() {
+            return Err(Error::BackendUnavailable(backend));
+        }
         let (narrow, wide) = backend.make_fills();
-        Aligner {
+        Ok(Aligner {
             backend,
             narrow,
             wide,
@@ -265,9 +291,10 @@ impl Aligner {
             f: Vec::new(),
             last_col: Vec::new(),
             trace: Vec::new(),
-        }
+        })
     }
 
+    /// The vector instruction set in use.
     pub fn backend(&self) -> Backend {
         self.backend
     }
@@ -307,47 +334,23 @@ impl Aligner {
         if narrow_lanes_apply(params)
             && let Some(narrow) = self.narrow.as_mut()
         {
-            if let Some((end_row, end_col, trailing)) =
-                narrow.fill(reference, alternate, params, strategy)
+            if let Some(alignment) =
+                align_on(narrow.as_mut(), reference, alternate, params, strategy)
             {
-                let narrow: &dyn DiagFill = &**narrow;
-                return Ok(traceback(
-                    |i, j| narrow.trace_at(i, j),
-                    alternate.len(),
-                    end_row,
-                    end_col,
-                    trailing,
-                    strategy,
-                ));
+                return Ok(alignment);
             }
             self.narrow_fallbacks += 1;
             stats::record_fallback(params, strategy);
         }
         if let Some(wide) = self.wide.as_mut()
-            && let Some((end_row, end_col, trailing)) =
-                wide.fill(reference, alternate, params, strategy)
+            && let Some(alignment) = align_on(wide.as_mut(), reference, alternate, params, strategy)
         {
-            let wide: &dyn DiagFill = &**wide;
-            return Ok(traceback(
-                |i, j| wide.trace_at(i, j),
-                alternate.len(),
-                end_row,
-                end_col,
-                trailing,
-                strategy,
-            ));
+            return Ok(alignment);
         }
         let (end_row, end_col, trailing) = self.fill(reference, alternate, params, strategy);
         let cols = alternate.len() + 1;
         let trace = &self.trace;
-        Ok(traceback(
-            |i, j| trace[i * cols + j],
-            alternate.len(),
-            end_row,
-            end_col,
-            trailing,
-            strategy,
-        ))
+        Ok(traceback(|i, j| trace[i * cols + j], end_row, end_col, trailing, strategy))
     }
 
     /// Fills the traceback and returns the cell the alignment ends in plus the number of
@@ -436,6 +439,12 @@ impl Aligner {
     }
 }
 
+impl Default for Aligner {
+    fn default() -> Self {
+        Aligner::new()
+    }
+}
+
 /// Chooses the cell the alignment ends in from the last column and bottom row scores, as GATK's
 /// `calculateCigar` does, returning `(row, column, trailing alternate bases)`.
 fn select_end(
@@ -473,17 +482,28 @@ fn select_end(
     (p1, p2, trailing)
 }
 
+/// Fills the matrix on a vector kernel and walks its traceback; `None` when the kernel's lanes
+/// saturated and the pair must be redone in wider lanes.
+fn align_on(
+    fill: &mut dyn DiagFill,
+    reference: &[u8],
+    alternate: &[u8],
+    params: &SwParameters,
+    strategy: OverhangStrategy,
+) -> Option<Alignment> {
+    let (end_row, end_col, trailing) = fill.fill(reference, alternate, params, strategy)?;
+    Some(traceback(|i, j| fill.trace_at(i, j), end_row, end_col, trailing, strategy))
+}
+
 /// Walks the traceback from the end cell `(p1, p2)` and builds the CIGAR exactly as GATK does,
 /// reading each cell's flags through `trace`.
 fn traceback(
     trace: impl Fn(usize, usize) -> u8,
-    alt_len: usize,
     mut p1: usize,
     mut p2: usize,
     trailing: usize,
     strategy: OverhangStrategy,
 ) -> Alignment {
-    let _ = alt_len;
     let mut elements: Vec<CigarElement> = Vec::with_capacity(8);
     let mut segment = trailing;
     if segment > 0 && strategy == OverhangStrategy::SoftClip {
@@ -563,7 +583,7 @@ fn traceback(
 }
 
 /// GATK's `Utils.lastIndexOf`: the start of the last occurrence of `query` in `reference`.
-pub fn last_index_of(reference: &[u8], query: &[u8]) -> Option<usize> {
+pub(crate) fn last_index_of(reference: &[u8], query: &[u8]) -> Option<usize> {
     if query.len() > reference.len() {
         return None;
     }
@@ -577,7 +597,7 @@ pub fn last_index_of(reference: &[u8], query: &[u8]) -> Option<usize> {
 mod stats {
     use std::collections::{BTreeMap, HashSet};
     use std::hash::{DefaultHasher, Hash, Hasher};
-    use std::sync::{Mutex, Once, OnceLock};
+    use std::sync::{Mutex, Once, OnceLock, PoisonError};
 
     use super::{OverhangStrategy, SwParameters};
 
@@ -593,6 +613,20 @@ mod stats {
         /// actually aligned, to see how many alignments repeat an earlier one.
         distinct_pairs: HashSet<u64>,
         distinct_alternates: HashSet<u64>,
+    }
+
+    type Key = (i32, i32, i32, i32, &'static str);
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static COUNTERS: Mutex<BTreeMap<Key, Counters>> = Mutex::new(BTreeMap::new());
+    static REGISTER_EXIT_HOOK: Once = Once::new();
+
+    unsafe extern "C" {
+        fn atexit(callback: extern "C" fn()) -> i32;
+    }
+
+    fn enabled() -> bool {
+        *ENABLED.get_or_init(|| std::env::var_os("FGKL_SW_STATS").is_some())
     }
 
     fn key(params: &SwParameters, strategy: OverhangStrategy) -> Key {
@@ -619,16 +653,6 @@ mod stats {
         hasher.finish()
     }
 
-    type Key = (i32, i32, i32, i32, &'static str);
-
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    static COUNTERS: Mutex<BTreeMap<Key, Counters>> = Mutex::new(BTreeMap::new());
-    static REGISTER_EXIT_HOOK: Once = Once::new();
-
-    unsafe extern "C" {
-        fn atexit(callback: extern "C" fn()) -> i32;
-    }
-
     extern "C" fn print_at_exit() {
         print();
     }
@@ -640,17 +664,17 @@ mod stats {
         strategy: OverhangStrategy,
         exact: bool,
     ) {
-        let (reference_len, alternate_len) = (reference.len(), alternate.len());
-        if !*ENABLED.get_or_init(|| std::env::var_os("FGKL_SW_STATS").is_some()) {
+        if !enabled() {
             return;
         }
+        let (reference_len, alternate_len) = (reference.len(), alternate.len());
         REGISTER_EXIT_HOOK.call_once(|| {
             // SAFETY: registering a plain `extern "C" fn()` with the C runtime's exit hook.
             unsafe {
                 atexit(print_at_exit);
             }
         });
-        let mut counters = COUNTERS.lock().unwrap();
+        let mut counters = COUNTERS.lock().unwrap_or_else(PoisonError::into_inner);
         let c = counters.entry(key(params, strategy)).or_default();
         c.calls += 1;
         c.max_reference = c.max_reference.max(reference_len);
@@ -666,16 +690,17 @@ mod stats {
     }
 
     pub(super) fn record_fallback(params: &SwParameters, strategy: OverhangStrategy) {
-        if !*ENABLED.get_or_init(|| std::env::var_os("FGKL_SW_STATS").is_some()) {
+        if !enabled() {
             return;
         }
-        let mut counters = COUNTERS.lock().unwrap();
+        let mut counters = COUNTERS.lock().unwrap_or_else(PoisonError::into_inner);
         counters.entry(key(params, strategy)).or_default().narrow_fallbacks += 1;
     }
 
-    /// Writes one line per parameter set and overhang strategy to stderr.
-    pub fn print() {
-        let counters = COUNTERS.lock().unwrap();
+    /// Writes one line per parameter set and overhang strategy to stderr. Runs from the C exit
+    /// hook, where a poisoned lock must not turn into an abort.
+    fn print() {
+        let counters = COUNTERS.lock().unwrap_or_else(PoisonError::into_inner);
         for (&(m, x, o, e, st), c) in counters.iter() {
             eprintln!(
                 "fgkl sw stats  params={m}/{x}/{o}/{e} strategy={st} calls={} exact_match={} aligned={} distinct_pairs={} distinct_alternates={} cells={} narrow_fallbacks={} max_reference={} max_alternate={}",
@@ -775,7 +800,7 @@ mod tests {
         let expected = reference::align(reference, alt, params, strategy);
         for backend in Backend::available() {
             for narrow in [true, false] {
-                let mut aligner = Aligner::with_backend(backend);
+                let mut aligner = Aligner::with_backend(backend).unwrap();
                 if !narrow {
                     aligner = aligner.without_narrow_lanes();
                 }
@@ -802,7 +827,7 @@ mod tests {
             .into_iter()
             .filter(|&b| b != Backend::Scalar)
             .map(|backend| {
-                let mut aligner = Aligner::with_backend(backend);
+                let mut aligner = Aligner::with_backend(backend).unwrap();
                 let actual = aligner.align(reference, alt, params, strategy).unwrap();
                 assert_eq!(actual, reference::align(reference, alt, params, strategy));
                 (backend, aligner.narrow_fallbacks())

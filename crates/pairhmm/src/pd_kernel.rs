@@ -22,22 +22,156 @@
 //! in the initial deletion value, so a snapshot is rescaled by the haplotype-length ratio exactly
 //! as in the plain kernel. Snapshots also hold the branch values of their column.
 
-use crate::ReadRef;
-use crate::model::{
-    DELETION_TO_DELETION, INDEL_TO_MATCH, INSERTION_TO_INSERTION, MATCH_TO_DELETION,
-    MATCH_TO_INSERTION, MATCH_TO_MATCH, NUM_TRANSITIONS, TABLES,
+use std::cell::RefCell;
+
+use crate::kernel::{CellState, Transitions, finish_lane};
+use crate::model::{NUM_TRANSITIONS, TABLES};
+use crate::pd::{
+    ALT_A, ALT_C, ALT_G, ALT_T, DEL_END, DEL_START, PdHaplotype, SNP, base_matches_pd,
 };
-use crate::pdhmm::{ALT_A, ALT_C, ALT_G, ALT_T, DEL_END, DEL_START, SNP, base_matches_pd};
-use crate::simd::{AlignedVec, Float, Simd};
+use crate::simd::{self, AlignedVec, Float, Simd, with_flush_to_zero};
+use crate::{Backend, HapSet, Precision, ReadRef, RunnerKey};
 
 const NORMAL: u8 = 0;
 const INSIDE_DEL: u8 = 1;
 const AFTER_DEL: u8 = 2;
 
+/// Haplotypes in kernel order with their flags resolved into per-column prior codes, `DEL_END`
+/// columns and deletion-state runs, plus the bookkeeping for prefix sharing.
+pub(crate) struct SortedPdHaps<'a> {
+    /// `order[k]` is the caller's index of the k-th sorted haplotype.
+    pub order: Vec<usize>,
+    pub bases: Vec<&'a [u8]>,
+    pub flags: Vec<&'a [u8]>,
+    /// Per haplotype, the prior-table code of each column.
+    codes: Vec<Vec<u8>>,
+    /// Per haplotype, the 1-based columns carrying `DEL_END`.
+    del_end_cols: Vec<Vec<usize>>,
+    /// Per haplotype, the column runs of the first row and of every later row.
+    first_row: Vec<Vec<Segment>>,
+    later_rows: Vec<Vec<Segment>>,
+    /// `lcp[k]` is the number of leading columns sorted haplotypes `k-1` and `k` share (same
+    /// base and flag, same row-end state); `lcp[0]` is 0.
+    pub lcp: Vec<usize>,
+    match_sets: Vec<MatchSet>,
+    pub max_len: usize,
+}
+
+impl<'a> SortedPdHaps<'a> {
+    pub fn new(haplotypes: &[PdHaplotype<'a>]) -> Self {
+        // The first row's runs also give the state carried out of every row, which sorts the
+        // haplotypes and starts the runs of the later rows.
+        let first_rows: Vec<(Vec<Segment>, u8)> =
+            haplotypes.iter().map(|h| segments(h.flags, NORMAL)).collect();
+        let end_states: Vec<u8> = first_rows.iter().map(|(_, e)| *e).collect();
+        let key = |i: usize| {
+            let h = haplotypes[i];
+            (end_states[i], h.bases.iter().zip(h.flags))
+        };
+        let mut order: Vec<usize> = (0..haplotypes.len()).collect();
+        order.sort_by(|&a, &b| {
+            let (ea, ka) = key(a);
+            let (eb, kb) = key(b);
+            ea.cmp(&eb).then_with(|| ka.cmp(kb))
+        });
+        let mut match_sets: Vec<MatchSet> = Vec::new();
+        let mut codes = Vec::with_capacity(haplotypes.len());
+        let mut del_end_cols = Vec::with_capacity(haplotypes.len());
+        let mut first_row = Vec::with_capacity(haplotypes.len());
+        let mut later_rows = Vec::with_capacity(haplotypes.len());
+        for &i in &order {
+            let PdHaplotype { bases, flags } = haplotypes[i];
+            assert_eq!(bases.len(), flags.len(), "flags must be as long as the haplotype");
+            let hap_codes = bases
+                .iter()
+                .zip(flags)
+                .map(|(&b, &f)| {
+                    let set = MatchSet::of(b, f);
+                    let code = match match_sets.iter().position(|s| *s == set) {
+                        Some(p) => p,
+                        None => {
+                            match_sets.push(set);
+                            match_sets.len() - 1
+                        }
+                    };
+                    u8::try_from(code).expect("at most 256 distinct match sets")
+                })
+                .collect();
+            codes.push(hap_codes);
+            del_end_cols.push(
+                flags
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &f)| f & DEL_END != 0)
+                    .map(|(j, _)| j + 1)
+                    .collect(),
+            );
+            let (first, end_state) = &first_rows[i];
+            let (later, later_end) = segments(flags, *end_state);
+            debug_assert_eq!(*end_state, later_end, "row end state is fixed by the flags");
+            first_row.push(first.clone());
+            later_rows.push(later);
+        }
+        let mut lcp = vec![0; order.len()];
+        for k in 1..order.len() {
+            let (a, b) = (order[k - 1], order[k]);
+            if end_states[a] == end_states[b] {
+                let (ka, kb) = (key(a).1, key(b).1);
+                lcp[k] = ka.zip(kb).take_while(|(x, y)| x == y).count();
+            }
+        }
+        let max_len = haplotypes.iter().map(|h| h.bases.len()).max().unwrap_or(0);
+        SortedPdHaps {
+            bases: order.iter().map(|&i| haplotypes[i].bases).collect(),
+            flags: order.iter().map(|&i| haplotypes[i].flags).collect(),
+            order,
+            codes,
+            del_end_cols,
+            first_row,
+            later_rows,
+            lcp,
+            match_sets,
+            max_len,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.bases.len()
+    }
+}
+
+impl HapSet for SortedPdHaps<'_> {
+    fn len(&self) -> usize {
+        self.bases.len()
+    }
+
+    fn order(&self) -> &[usize] {
+        &self.order
+    }
+
+    fn single(&self, k: usize) -> Self {
+        SortedPdHaps::new(&[PdHaplotype { bases: self.bases[k], flags: self.flags[k] }])
+    }
+
+    fn lanes(key: RunnerKey) -> usize {
+        with_pd_runner(key, |runner| runner.lanes())
+    }
+
+    fn run_batch(
+        &self,
+        key: RunnerKey,
+        reads: &[ReadRef<'_>],
+        out: &mut [f64],
+        fallback: &mut Vec<(usize, usize)>,
+    ) {
+        with_pd_runner(key, |runner| runner.run(reads, self, out, fallback))
+    }
+}
+
 /// Columns `lo+1..=hi`, all computed in the same deletion state and all with (or all without)
 /// the `DEL_END` flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Segment {
+struct Segment {
     lo: usize,
     hi: usize,
     state: u8,
@@ -67,128 +201,51 @@ impl MatchSet {
     }
 }
 
-/// Haplotypes in kernel order with their flags resolved into per-column prior codes, `DEL_END`
-/// columns and deletion-state runs, plus the bookkeeping for prefix sharing.
-pub(crate) struct PdHaps<'a> {
-    /// `order[k]` is the caller's index of the k-th sorted haplotype.
-    pub order: Vec<usize>,
-    pub bases: Vec<&'a [u8]>,
-    pub flags: Vec<&'a [u8]>,
-    /// Per haplotype, the prior-table code of each column.
-    codes: Vec<Vec<u8>>,
-    /// Per haplotype, the 1-based columns carrying `DEL_END`.
-    del_end_cols: Vec<Vec<usize>>,
-    /// Per haplotype, the column runs of the first row and of every later row.
-    first_row: Vec<Vec<Segment>>,
-    later_rows: Vec<Vec<Segment>>,
-    /// `lcp[k]` is the number of leading columns sorted haplotypes `k-1` and `k` share (same
-    /// base and flag, same row-end state); `lcp[0]` is 0.
-    pub lcp: Vec<usize>,
-    match_sets: Vec<MatchSet>,
-    pub max_len: usize,
+thread_local! {
+    /// PD kernel workspaces, reused across calls on the same thread like the plain kernel's.
+    static PD_RUNNERS: RefCell<Vec<(RunnerKey, Box<dyn PdBatchRunner>)>> = const { RefCell::new(Vec::new()) };
 }
 
-impl<'a> PdHaps<'a> {
-    pub fn new(haplotypes: &[(&'a [u8], &'a [u8])]) -> Self {
-        let end_states: Vec<u8> = haplotypes.iter().map(|&(_, f)| segments(f, NORMAL).1).collect();
-        let key = |i: usize| {
-            let (b, f) = haplotypes[i];
-            (end_states[i], b.iter().zip(f))
-        };
-        let mut order: Vec<usize> = (0..haplotypes.len()).collect();
-        order.sort_by(|&a, &b| {
-            let (ea, ka) = key(a);
-            let (eb, kb) = key(b);
-            ea.cmp(&eb).then_with(|| ka.cmp(kb))
-        });
-        let mut match_sets: Vec<MatchSet> = Vec::new();
-        let mut codes = Vec::with_capacity(haplotypes.len());
-        let mut del_end_cols = Vec::with_capacity(haplotypes.len());
-        let mut first_row = Vec::with_capacity(haplotypes.len());
-        let mut later_rows = Vec::with_capacity(haplotypes.len());
-        for &i in &order {
-            let (bases, flags) = haplotypes[i];
-            assert_eq!(bases.len(), flags.len(), "flags must be as long as the haplotype");
-            let hap_codes = bases
-                .iter()
-                .zip(flags)
-                .map(|(&b, &f)| {
-                    let set = MatchSet::of(b, f);
-                    let code = match match_sets.iter().position(|s| *s == set) {
-                        Some(p) => p,
-                        None => {
-                            match_sets.push(set);
-                            match_sets.len() - 1
-                        }
-                    };
-                    u8::try_from(code).expect("at most 256 distinct match sets")
-                })
-                .collect();
-            codes.push(hap_codes);
-            del_end_cols.push(
-                flags
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &f)| f & DEL_END != 0)
-                    .map(|(j, _)| j + 1)
-                    .collect(),
-            );
-            let (first, end_state) = segments(flags, NORMAL);
-            let (later, later_end) = segments(flags, end_state);
-            debug_assert_eq!(end_state, later_end, "row end state is fixed by the flags");
-            first_row.push(first);
-            later_rows.push(later);
-        }
-        let mut lcp = vec![0; order.len()];
-        for k in 1..order.len() {
-            let (a, b) = (order[k - 1], order[k]);
-            if end_states[a] == end_states[b] {
-                let (ka, kb) = (key(a).1, key(b).1);
-                lcp[k] = ka.zip(kb).take_while(|(x, y)| x == y).count();
+/// Runs `f` with this thread's cached PD runner for `key`, creating it on first use.
+fn with_pd_runner<R>(key: RunnerKey, f: impl FnOnce(&mut dyn PdBatchRunner) -> R) -> R {
+    PD_RUNNERS.with(|cell| {
+        let mut runners = cell.borrow_mut();
+        let index = match runners.iter().position(|(k, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                runners.push((key, make_pd_runner(key)));
+                runners.len() - 1
             }
-        }
-        let max_len = haplotypes.iter().map(|(b, _)| b.len()).max().unwrap_or(0);
-        PdHaps {
-            bases: order.iter().map(|&i| haplotypes[i].0).collect(),
-            flags: order.iter().map(|&i| haplotypes[i].1).collect(),
-            order,
-            codes,
-            del_end_cols,
-            first_row,
-            later_rows,
-            lcp,
-            match_sets,
-            max_len,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.bases.len()
-    }
+        };
+        f(runners[index].1.as_mut())
+    })
 }
 
-/// Splits a row into runs of columns sharing a deletion state and `DEL_END` flag, starting the
-/// row in `state`; returns the runs and the state carried out of the last column.
-fn segments(flags: &[u8], mut state: u8) -> (Vec<Segment>, u8) {
-    let mut runs: Vec<Segment> = Vec::new();
-    for (j, &flag) in flags.iter().enumerate() {
-        let col = j + 1;
-        let del_end = flag & DEL_END != 0;
-        match runs.last_mut() {
-            Some(last) if last.state == state && last.del_end == del_end => last.hi = col,
-            _ => runs.push(Segment { lo: j, hi: col, state, del_end }),
-        }
-        if state == AFTER_DEL {
-            state = NORMAL;
-        }
-        if flag & DEL_START != 0 {
-            state = INSIDE_DEL;
-        }
-        if del_end {
-            state = AFTER_DEL;
-        }
+fn make_pd_runner(key: RunnerKey) -> Box<dyn PdBatchRunner> {
+    use simd::{ScalarF32, ScalarF64};
+    #[cfg(target_arch = "x86_64")]
+    if key.backend == Backend::Avx512 && !key.wide {
+        return match key.precision {
+            Precision::Float => Box::new(PdRunner::<simd::x86::Avx512F32Narrow>::new()),
+            Precision::Double => Box::new(PdRunner::<simd::x86::Avx512F64Narrow>::new()),
+        };
     }
-    (runs, state)
+    match (key.backend, key.precision) {
+        (Backend::Scalar, Precision::Float) => Box::new(PdRunner::<ScalarF32>::new()),
+        (Backend::Scalar, Precision::Double) => Box::new(PdRunner::<ScalarF64>::new()),
+        #[cfg(target_arch = "aarch64")]
+        (Backend::Neon, Precision::Float) => Box::new(PdRunner::<simd::neon::NeonF32>::new()),
+        #[cfg(target_arch = "aarch64")]
+        (Backend::Neon, Precision::Double) => Box::new(PdRunner::<simd::neon::NeonF64>::new()),
+        #[cfg(target_arch = "x86_64")]
+        (Backend::Avx2, Precision::Float) => Box::new(PdRunner::<simd::x86::Avx2F32>::new()),
+        #[cfg(target_arch = "x86_64")]
+        (Backend::Avx2, Precision::Double) => Box::new(PdRunner::<simd::x86::Avx2F64>::new()),
+        #[cfg(target_arch = "x86_64")]
+        (Backend::Avx512, Precision::Float) => Box::new(PdRunner::<simd::x86::Avx512F32>::new()),
+        #[cfg(target_arch = "x86_64")]
+        (Backend::Avx512, Precision::Double) => Box::new(PdRunner::<simd::x86::Avx512F64>::new()),
+    }
 }
 
 /// A PD kernel instantiated for one backend and precision, with its scratch memory.
@@ -201,7 +258,7 @@ pub(crate) trait PdBatchRunner: Send {
     fn run(
         &mut self,
         reads: &[ReadRef<'_>],
-        haps: &PdHaps<'_>,
+        haps: &SortedPdHaps<'_>,
         out: &mut [f64],
         fallback: &mut Vec<(usize, usize)>,
     );
@@ -220,7 +277,7 @@ impl<S: Simd> PdRunner<S> {
     fn run_impl(
         &mut self,
         reads: &[ReadRef<'_>],
-        haps: &PdHaps<'_>,
+        haps: &SortedPdHaps<'_>,
         out: &mut [f64],
         fallback: &mut Vec<(usize, usize)>,
     ) {
@@ -241,17 +298,7 @@ impl<S: Simd> PdRunner<S> {
             }
             ws.run_hap(haps, k, start);
             for lane in 0..reads.len() {
-                let raw = ws.acc[lane].to_f64();
-                let lost = match S::Elem::MIN_ACCEPTED {
-                    Some(threshold) => raw.is_nan() || raw < threshold,
-                    None => false,
-                };
-                out[lane * n_haps + k] = if lost {
-                    fallback.push((lane, k));
-                    f64::NAN
-                } else {
-                    raw.log10() - S::Elem::log10_initial_constant()
-                };
+                out[lane * n_haps + k] = finish_lane::<S::Elem>(ws.acc[lane], lane, k, fallback);
             }
         }
     }
@@ -266,11 +313,11 @@ macro_rules! pd_runner_impl {
             fn run(
                 &mut self,
                 reads: &[ReadRef<'_>],
-                haps: &PdHaps<'_>,
+                haps: &SortedPdHaps<'_>,
                 out: &mut [f64],
                 fallback: &mut Vec<(usize, usize)>,
             ) {
-                crate::kernel::with_flush_to_zero(|| self.run_impl(reads, haps, out, fallback))
+                with_flush_to_zero(|| self.run_impl(reads, haps, out, fallback))
             }
         }
     };
@@ -282,7 +329,7 @@ macro_rules! pd_runner_impl {
             fn run(
                 &mut self,
                 reads: &[ReadRef<'_>],
-                haps: &PdHaps<'_>,
+                haps: &SortedPdHaps<'_>,
                 out: &mut [f64],
                 fallback: &mut Vec<(usize, usize)>,
             ) {
@@ -290,7 +337,7 @@ macro_rules! pd_runner_impl {
                 unsafe fn go(
                     runner: &mut PdRunner<$ty>,
                     reads: &[ReadRef<'_>],
-                    haps: &PdHaps<'_>,
+                    haps: &SortedPdHaps<'_>,
                     out: &mut [f64],
                     fallback: &mut Vec<(usize, usize)>,
                 ) {
@@ -298,9 +345,7 @@ macro_rules! pd_runner_impl {
                 }
                 // SAFETY: runners of this type are only built after `Backend::is_available`
                 // confirmed the CPU supports the enabled features.
-                crate::kernel::with_flush_to_zero(|| unsafe {
-                    go(self, reads, haps, out, fallback)
-                })
+                with_flush_to_zero(|| unsafe { go(self, reads, haps, out, fallback) })
             }
         }
     };
@@ -389,6 +434,210 @@ struct Workspace<S: Simd> {
     later_runs: Vec<(Segment, bool)>,
 }
 
+impl<S: Simd> Workspace<S> {
+    fn new() -> Self {
+        Workspace {
+            rows: 0,
+            num_codes: 0,
+            trans: AlignedVec::new(),
+            prior: AlignedVec::new(),
+            end_mul: AlignedVec::new(),
+            end_rows: Vec::new(),
+            acc: AlignedVec::new(),
+            row_prev: RowBuf::new(),
+            row_cur: RowBuf::new(),
+            snapshots: Vec::new(),
+            lcp_counts: Vec::new(),
+            snap_cols: Vec::new(),
+            first_runs: Vec::new(),
+            later_runs: Vec::new(),
+        }
+    }
+
+    /// Fills the per-read tables for a batch and sizes every buffer for the haplotype set.
+    fn prepare(&mut self, reads: &[ReadRef<'_>], haps: &SortedPdHaps<'_>) {
+        let lanes = S::LANES;
+        assert!(reads.len() <= lanes, "batch larger than the lane count");
+        let rows = reads.iter().map(|r| r.len()).max().unwrap_or(0);
+        let num_codes = haps.match_sets.len();
+        self.rows = rows;
+        self.num_codes = num_codes;
+        self.trans.resize(rows * NUM_TRANSITIONS * lanes, S::Elem::ZERO);
+        self.prior.resize(rows * num_codes * lanes, S::Elem::ZERO);
+        self.end_mul.resize(rows * lanes, S::Elem::ZERO);
+        self.end_rows.clear();
+        self.end_rows.resize(rows, false);
+        for (lane, read) in reads.iter().enumerate() {
+            for r in 0..read.len() {
+                let t = TABLES.transitions(read.ins_gop[r], read.del_gop[r], read.gcp[r]);
+                for (k, &prob) in t.iter().enumerate() {
+                    self.trans[(r * NUM_TRANSITIONS + k) * lanes + lane] = S::Elem::from_f64(prob);
+                }
+                let (p_match, p_mismatch) = TABLES.priors(read.quals[r]);
+                let read_base = read.bases[r];
+                for (code, set) in haps.match_sets.iter().enumerate() {
+                    let p = if set.accepts(read_base) { p_match } else { p_mismatch };
+                    self.prior[(r * num_codes + code) * lanes + lane] = S::Elem::from_f64(p);
+                }
+            }
+            self.end_mul[(read.len() - 1) * lanes + lane] = S::Elem::ONE;
+            self.end_rows[read.len() - 1] = true;
+        }
+        let cols = haps.max_len + 1;
+        self.row_prev.resize(cols * lanes);
+        self.row_cur.resize(cols * lanes);
+        self.acc.resize(lanes, S::Elem::ZERO);
+        if self.snapshots.len() < cols {
+            self.snapshots.resize_with(cols, Snapshot::new);
+        }
+        for snap in &mut self.snapshots[..cols] {
+            snap.resize((rows + 1) * lanes, lanes);
+        }
+        // The virtual column before the haplotype: nothing but the initial deletion probability
+        // in row zero, zero branch values (GATK never writes branch column zero), recorded for a
+        // haplotype of length one so the length rescaling applies.
+        let origin = &mut self.snapshots[0];
+        origin.m.fill(S::Elem::ZERO);
+        origin.x.fill(S::Elem::ZERO);
+        origin.y.fill(S::Elem::ZERO);
+        origin.bm.fill(S::Elem::ZERO);
+        origin.bx.fill(S::Elem::ZERO);
+        origin.by.fill(S::Elem::ZERO);
+        origin.y[..lanes].fill(S::Elem::INITIAL_CONSTANT);
+        origin.acc.fill(S::Elem::ZERO);
+        origin.hap_len = 1;
+        self.lcp_counts.clear();
+        self.lcp_counts.resize(cols, 0);
+        for &p in &haps.lcp[1..] {
+            self.lcp_counts[p] += 1;
+        }
+    }
+
+    /// Runs haplotype `k` from column `start`, whose state comes from the snapshot at that
+    /// column, leaving the per-lane raw result in `acc` and recording the snapshots listed in
+    /// `snap_cols`.
+    #[inline(always)]
+    fn run_hap(&mut self, haps: &SortedPdHaps<'_>, k: usize, start: usize) {
+        let lanes = S::LANES;
+        let rows = self.rows;
+        let num_codes = self.num_codes;
+        let hap_len = haps.bases[k].len();
+        let codes: &[u8] = &haps.codes[k];
+        let Workspace {
+            trans,
+            prior,
+            end_mul,
+            end_rows,
+            acc,
+            row_prev,
+            row_cur,
+            snapshots,
+            snap_cols,
+            first_runs,
+            later_runs,
+            ..
+        } = self;
+        cut_runs(&haps.first_row[k], start, snap_cols, first_runs);
+        cut_runs(&haps.later_rows[k], start, snap_cols, later_runs);
+        let (before, after) = snapshots.split_at_mut(start + 1);
+        let src = &before[start];
+        let trans: &[S::Elem] = trans;
+        let prior: &[S::Elem] = prior;
+        let end_mul: &[S::Elem] = end_mul;
+        let zero = S::zero();
+        let init = S::splat(S::Elem::from_f64(S::Elem::INITIAL_CONSTANT.to_f64() / hap_len as f64));
+        let scale = S::splat(S::Elem::from_f64(src.hap_len as f64 / hap_len as f64));
+
+        // Row zero: free deletions along the haplotype, and zero branch values.
+        for j in start..=hap_len {
+            zero.store(&mut row_prev.m[j * lanes..]);
+            zero.store(&mut row_prev.x[j * lanes..]);
+            init.store(&mut row_prev.y[j * lanes..]);
+        }
+        for &j in &haps.del_end_cols[k] {
+            zero.store(&mut row_prev.bm[j * lanes..]);
+            zero.store(&mut row_prev.bx[j * lanes..]);
+            zero.store(&mut row_prev.by[j * lanes..]);
+        }
+        let mut acc_v = S::load(&src.acc).mul(scale);
+        for &q in snap_cols.iter() {
+            let snap = &mut after[q - start - 1];
+            snap.hap_len = hap_len;
+            zero.store(&mut snap.m[..lanes]);
+            zero.store(&mut snap.x[..lanes]);
+            init.store(&mut snap.y[..lanes]);
+            zero.store(&mut snap.bm[..lanes]);
+            zero.store(&mut snap.bx[..lanes]);
+            zero.store(&mut snap.by[..lanes]);
+            acc_v.store(&mut snap.acc);
+        }
+        if start == hap_len {
+            acc_v.store(acc);
+            return;
+        }
+
+        for i in 1..=rows {
+            let r = i - 1;
+            let t = Transitions::<S>::load(trans, r);
+            let prior_row = &prior[r * num_codes * lanes..(r + 1) * num_codes * lanes];
+            // The shared column's state for this row and the row above, rescaled. The row above's
+            // branch values are also placed in the previous row buffer, where an `AfterDel`
+            // column right after the shared prefix reads them.
+            let mut st = CellState {
+                m_diag: S::load(&src.m[(i - 1) * lanes..]).mul(scale),
+                x_diag: S::load(&src.x[(i - 1) * lanes..]).mul(scale),
+                y_diag: S::load(&src.y[(i - 1) * lanes..]).mul(scale),
+                m_left: S::load(&src.m[i * lanes..]).mul(scale),
+                x_left: S::load(&src.x[i * lanes..]).mul(scale),
+                y_left: S::load(&src.y[i * lanes..]).mul(scale),
+            };
+            let mut branch = Branch {
+                m: S::load(&src.bm[i * lanes..]).mul(scale),
+                x: S::load(&src.bx[i * lanes..]).mul(scale),
+                y: S::load(&src.by[i * lanes..]).mul(scale),
+            };
+            S::load(&src.bm[(i - 1) * lanes..]).mul(scale).store(&mut row_prev.bm[start * lanes..]);
+            S::load(&src.bx[(i - 1) * lanes..]).mul(scale).store(&mut row_prev.bx[start * lanes..]);
+            S::load(&src.by[(i - 1) * lanes..]).mul(scale).store(&mut row_prev.by[start * lanes..]);
+            let runs: &[(Segment, bool)] = if i == 1 { first_runs } else { later_runs };
+            let ends_here = end_rows[r];
+            let mut rowsum = zero;
+            for (seg, at_snap) in runs {
+                (st, branch) = dispatch::<S>(
+                    seg,
+                    ends_here,
+                    &t,
+                    prior_row,
+                    codes,
+                    row_prev,
+                    row_cur,
+                    st,
+                    branch,
+                    &mut rowsum,
+                );
+                if *at_snap {
+                    let snap = &mut after[seg.hi - start - 1];
+                    st.m_left.store(&mut snap.m[i * lanes..]);
+                    st.x_left.store(&mut snap.x[i * lanes..]);
+                    st.y_left.store(&mut snap.y[i * lanes..]);
+                    branch.m.store(&mut snap.bm[i * lanes..]);
+                    branch.x.store(&mut snap.bx[i * lanes..]);
+                    branch.y.store(&mut snap.by[i * lanes..]);
+                    if ends_here {
+                        let e = S::load(&end_mul[r * lanes..]);
+                        e.mul_add(rowsum, S::load(&snap.acc)).store(&mut snap.acc);
+                    }
+                }
+            }
+            if ends_here {
+                acc_v = S::load(&end_mul[r * lanes..]).mul_add(rowsum, acc_v);
+            }
+            std::mem::swap(row_prev, row_cur);
+        }
+        acc_v.store(acc);
+    }
+}
+
 /// The DP state of one column for every row, kept so a later haplotype can start from it: the
 /// match, insertion and deletion values and the branch values after that column.
 struct Snapshot<E> {
@@ -454,216 +703,28 @@ fn cut_runs(segs: &[Segment], start: usize, snap_cols: &[usize], out: &mut Vec<(
     }
 }
 
-impl<S: Simd> Workspace<S> {
-    fn new() -> Self {
-        Workspace {
-            rows: 0,
-            num_codes: 0,
-            trans: AlignedVec::new(),
-            prior: AlignedVec::new(),
-            end_mul: AlignedVec::new(),
-            end_rows: Vec::new(),
-            acc: AlignedVec::new(),
-            row_prev: RowBuf::new(),
-            row_cur: RowBuf::new(),
-            snapshots: Vec::new(),
-            lcp_counts: Vec::new(),
-            snap_cols: Vec::new(),
-            first_runs: Vec::new(),
-            later_runs: Vec::new(),
+/// Splits a row into runs of columns sharing a deletion state and `DEL_END` flag, starting the
+/// row in `state`; returns the runs and the state carried out of the last column.
+fn segments(flags: &[u8], mut state: u8) -> (Vec<Segment>, u8) {
+    let mut runs: Vec<Segment> = Vec::new();
+    for (j, &flag) in flags.iter().enumerate() {
+        let col = j + 1;
+        let del_end = flag & DEL_END != 0;
+        match runs.last_mut() {
+            Some(last) if last.state == state && last.del_end == del_end => last.hi = col,
+            _ => runs.push(Segment { lo: j, hi: col, state, del_end }),
+        }
+        if state == AFTER_DEL {
+            state = NORMAL;
+        }
+        if flag & DEL_START != 0 {
+            state = INSIDE_DEL;
+        }
+        if del_end {
+            state = AFTER_DEL;
         }
     }
-
-    /// Fills the per-read tables for a batch and sizes every buffer for the haplotype set.
-    fn prepare(&mut self, reads: &[ReadRef<'_>], haps: &PdHaps<'_>) {
-        let lanes = S::LANES;
-        assert!(reads.len() <= lanes, "batch larger than the lane count");
-        let rows = reads.iter().map(|r| r.len()).max().unwrap_or(0);
-        let num_codes = haps.match_sets.len();
-        self.rows = rows;
-        self.num_codes = num_codes;
-        self.trans.resize(rows * NUM_TRANSITIONS * lanes, S::Elem::ZERO);
-        self.prior.resize(rows * num_codes * lanes, S::Elem::ZERO);
-        self.end_mul.resize(rows * lanes, S::Elem::ZERO);
-        self.end_rows.clear();
-        self.end_rows.resize(rows, false);
-        for (lane, read) in reads.iter().enumerate() {
-            for r in 0..read.len() {
-                let t = TABLES.transitions(read.ins_gop[r], read.del_gop[r], read.gcp[r]);
-                for (k, &prob) in t.iter().enumerate() {
-                    self.trans[(r * NUM_TRANSITIONS + k) * lanes + lane] = S::Elem::from_f64(prob);
-                }
-                let (p_match, p_mismatch) = TABLES.priors(read.quals[r]);
-                let read_base = read.bases[r];
-                for (code, set) in haps.match_sets.iter().enumerate() {
-                    let p = if set.accepts(read_base) { p_match } else { p_mismatch };
-                    self.prior[(r * num_codes + code) * lanes + lane] = S::Elem::from_f64(p);
-                }
-            }
-            self.end_mul[(read.len() - 1) * lanes + lane] = S::Elem::ONE;
-            self.end_rows[read.len() - 1] = true;
-        }
-        let cols = haps.max_len + 1;
-        self.row_prev.resize(cols * lanes);
-        self.row_cur.resize(cols * lanes);
-        self.acc.resize(lanes, S::Elem::ZERO);
-        if self.snapshots.len() < cols {
-            self.snapshots.resize_with(cols, Snapshot::new);
-        }
-        for snap in &mut self.snapshots[..cols] {
-            snap.resize((rows + 1) * lanes, lanes);
-        }
-        // The virtual column before the haplotype: nothing but the initial deletion probability
-        // in row zero, zero branch values (GATK never writes branch column zero), recorded for a
-        // haplotype of length one so the length rescaling applies.
-        let origin = &mut self.snapshots[0];
-        origin.m.fill(S::Elem::ZERO);
-        origin.x.fill(S::Elem::ZERO);
-        origin.y.fill(S::Elem::ZERO);
-        origin.bm.fill(S::Elem::ZERO);
-        origin.bx.fill(S::Elem::ZERO);
-        origin.by.fill(S::Elem::ZERO);
-        origin.y[..lanes].fill(S::Elem::INITIAL_CONSTANT);
-        origin.acc.fill(S::Elem::ZERO);
-        origin.hap_len = 1;
-        self.lcp_counts.clear();
-        self.lcp_counts.resize(cols, 0);
-        for &p in &haps.lcp[1..] {
-            self.lcp_counts[p] += 1;
-        }
-    }
-
-    /// Runs haplotype `k` from column `start`, whose state comes from the snapshot at that
-    /// column, leaving the per-lane raw result in `acc` and recording the snapshots listed in
-    /// `snap_cols`.
-    #[inline(always)]
-    fn run_hap(&mut self, haps: &PdHaps<'_>, k: usize, start: usize) {
-        let lanes = S::LANES;
-        let rows = self.rows;
-        let num_codes = self.num_codes;
-        let hap_len = haps.bases[k].len();
-        let codes: &[u8] = &haps.codes[k];
-        let Workspace {
-            trans,
-            prior,
-            end_mul,
-            end_rows,
-            acc,
-            row_prev,
-            row_cur,
-            snapshots,
-            snap_cols,
-            first_runs,
-            later_runs,
-            ..
-        } = self;
-        cut_runs(&haps.first_row[k], start, snap_cols, first_runs);
-        cut_runs(&haps.later_rows[k], start, snap_cols, later_runs);
-        let (before, after) = snapshots.split_at_mut(start + 1);
-        let src = &before[start];
-        let trans: &[S::Elem] = trans;
-        let prior: &[S::Elem] = prior;
-        let end_mul: &[S::Elem] = end_mul;
-        let zero = S::zero();
-        let init = S::splat(S::Elem::from_f64(S::Elem::INITIAL_CONSTANT.to_f64() / hap_len as f64));
-        let scale = S::splat(S::Elem::from_f64(src.hap_len as f64 / hap_len as f64));
-
-        // Row zero: free deletions along the haplotype, and zero branch values.
-        for j in start..=hap_len {
-            zero.store(&mut row_prev.m[j * lanes..]);
-            zero.store(&mut row_prev.x[j * lanes..]);
-            init.store(&mut row_prev.y[j * lanes..]);
-        }
-        for &j in &haps.del_end_cols[k] {
-            zero.store(&mut row_prev.bm[j * lanes..]);
-            zero.store(&mut row_prev.bx[j * lanes..]);
-            zero.store(&mut row_prev.by[j * lanes..]);
-        }
-        let mut acc_v = S::load(&src.acc).mul(scale);
-        for &q in snap_cols.iter() {
-            let snap = &mut after[q - start - 1];
-            snap.hap_len = hap_len;
-            zero.store(&mut snap.m[..lanes]);
-            zero.store(&mut snap.x[..lanes]);
-            init.store(&mut snap.y[..lanes]);
-            zero.store(&mut snap.bm[..lanes]);
-            zero.store(&mut snap.bx[..lanes]);
-            zero.store(&mut snap.by[..lanes]);
-            acc_v.store(&mut snap.acc);
-        }
-        if start == hap_len {
-            acc_v.store(acc);
-            return;
-        }
-
-        for i in 1..=rows {
-            let r = i - 1;
-            let tb = r * NUM_TRANSITIONS * lanes;
-            let t = Transitions {
-                mm: S::load(&trans[tb + MATCH_TO_MATCH * lanes..]),
-                im: S::load(&trans[tb + INDEL_TO_MATCH * lanes..]),
-                mi: S::load(&trans[tb + MATCH_TO_INSERTION * lanes..]),
-                ii: S::load(&trans[tb + INSERTION_TO_INSERTION * lanes..]),
-                md: S::load(&trans[tb + MATCH_TO_DELETION * lanes..]),
-                dd: S::load(&trans[tb + DELETION_TO_DELETION * lanes..]),
-            };
-            let prior_row = &prior[r * num_codes * lanes..(r + 1) * num_codes * lanes];
-            // The shared column's state for this row and the row above, rescaled. The row above's
-            // branch values are also placed in the previous row buffer, where an `AfterDel`
-            // column right after the shared prefix reads them.
-            let mut st = CellState {
-                m_diag: S::load(&src.m[(i - 1) * lanes..]).mul(scale),
-                x_diag: S::load(&src.x[(i - 1) * lanes..]).mul(scale),
-                y_diag: S::load(&src.y[(i - 1) * lanes..]).mul(scale),
-                m_left: S::load(&src.m[i * lanes..]).mul(scale),
-                x_left: S::load(&src.x[i * lanes..]).mul(scale),
-                y_left: S::load(&src.y[i * lanes..]).mul(scale),
-            };
-            let mut branch = Branch {
-                m: S::load(&src.bm[i * lanes..]).mul(scale),
-                x: S::load(&src.bx[i * lanes..]).mul(scale),
-                y: S::load(&src.by[i * lanes..]).mul(scale),
-            };
-            S::load(&src.bm[(i - 1) * lanes..]).mul(scale).store(&mut row_prev.bm[start * lanes..]);
-            S::load(&src.bx[(i - 1) * lanes..]).mul(scale).store(&mut row_prev.bx[start * lanes..]);
-            S::load(&src.by[(i - 1) * lanes..]).mul(scale).store(&mut row_prev.by[start * lanes..]);
-            let runs: &[(Segment, bool)] = if i == 1 { first_runs } else { later_runs };
-            let ends_here = end_rows[r];
-            let mut rowsum = zero;
-            for (seg, at_snap) in runs {
-                (st, branch) = dispatch::<S>(
-                    seg,
-                    ends_here,
-                    &t,
-                    prior_row,
-                    codes,
-                    row_prev,
-                    row_cur,
-                    st,
-                    branch,
-                    &mut rowsum,
-                );
-                if *at_snap {
-                    let snap = &mut after[seg.hi - start - 1];
-                    st.m_left.store(&mut snap.m[i * lanes..]);
-                    st.x_left.store(&mut snap.x[i * lanes..]);
-                    st.y_left.store(&mut snap.y[i * lanes..]);
-                    branch.m.store(&mut snap.bm[i * lanes..]);
-                    branch.x.store(&mut snap.bx[i * lanes..]);
-                    branch.y.store(&mut snap.by[i * lanes..]);
-                    if ends_here {
-                        let e = S::load(&end_mul[r * lanes..]);
-                        e.mul_add(rowsum, S::load(&snap.acc)).store(&mut snap.acc);
-                    }
-                }
-            }
-            if ends_here {
-                acc_v = S::load(&end_mul[r * lanes..]).mul_add(rowsum, acc_v);
-            }
-            std::mem::swap(row_prev, row_cur);
-        }
-        acc_v.store(acc);
-    }
+    (runs, state)
 }
 
 /// Runs one segment on the inner loop specialised for its state and flags.
@@ -703,29 +764,6 @@ fn dispatch<S: Simd>(
         (AFTER_DEL, true, true) => go!(AFTER_DEL, true, true),
         _ => unreachable!("unknown deletion state"),
     }
-}
-
-/// The six transition probabilities of one read position, one vector each.
-#[derive(Clone, Copy)]
-struct Transitions<S> {
-    mm: S,
-    im: S,
-    mi: S,
-    ii: S,
-    md: S,
-    dd: S,
-}
-
-/// The neighbours of the next cell in a row sweep: the previous row's values one column back and
-/// the current row's values one column back.
-#[derive(Clone, Copy)]
-struct CellState<S> {
-    m_diag: S,
-    x_diag: S,
-    y_diag: S,
-    m_left: S,
-    x_left: S,
-    y_left: S,
 }
 
 /// GATK's three branch values at the column one back in the current row. Kept apart from

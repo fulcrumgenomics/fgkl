@@ -43,13 +43,7 @@ impl Args {
                 "--iters" => args.iters = value.parse().unwrap(),
                 "--seed" => args.seed = value.parse().unwrap(),
                 "--backend" => args.backend = Some(value.parse().unwrap()),
-                "--precision" => {
-                    args.precision = Some(match value.as_str() {
-                        "float" => Precision::Float,
-                        "double" => Precision::Double,
-                        other => panic!("unknown precision {other}"),
-                    })
-                }
+                "--precision" => args.precision = Some(value.parse().unwrap()),
                 other => panic!("unknown flag {other}"),
             }
         }
@@ -100,14 +94,10 @@ fn main() {
                 .zip(&expected)
                 .map(|(a, e)| (a - e).abs())
                 .fold(0.0f64, f64::max);
-            let prec = match precision {
-                Precision::Float => "float",
-                Precision::Double => "double",
-            };
             println!(
                 "{:<8} {:<7} {:>10.2} {:>12.1} {:>12.2e}",
                 backend.name(),
-                prec,
+                precision.name(),
                 best * 1e3,
                 cells as f64 / best / 1e6,
                 err

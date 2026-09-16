@@ -6,8 +6,9 @@ group = "com.fulcrumgenomics"
 version = "0.1.0-SNAPSHOT"
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
+    // Compile against the JDK 17 API, not merely at source level 17, so the JAR cannot pick up
+    // newer APIs that GATK's JDK 17 lacks.
+    toolchain { languageVersion = JavaLanguageVersion.of(17) }
     withJavadocJar()
     withSourcesJar()
 }
@@ -26,6 +27,16 @@ tasks.withType<JavaCompile> {
     options.encoding = "UTF-8"
 }
 
+tasks.jar {
+    manifest {
+        attributes(
+            "Automatic-Module-Name" to "com.fulcrumgenomics.fgkl",
+            "Implementation-Title" to project.name,
+            "Implementation-Version" to project.version,
+        )
+    }
+}
+
 tasks.test {
     useJUnitPlatform()
     // Assertions and JNI checks catch marshalling mistakes in the native layer early.
@@ -38,8 +49,10 @@ tasks.javadoc {
 }
 
 // ---------------------------------------------------------------------------
-// Native build: cargo builds the JNI cdylib for the current (or FGKL_TARGET) platform and the
-// result is copied under src/main/resources/native/<os>-<arch>/ for NativeLoader.
+// Native build: cargo builds the JNI cdylib for the host (or FGKL_PLATFORM) platform into
+// build/native/<os>-<arch>/ and processResources packages it at native/<os>-<arch>/ in the JAR,
+// where NativeLoader looks for it. A multi-platform JAR is assembled by dropping the other
+// platforms' libraries into build/native/ before packaging.
 // ---------------------------------------------------------------------------
 
 /** Canonical platform string such as "osx-aarch64" or "linux-x86_64". */
@@ -72,39 +85,36 @@ fun rustTarget(platform: String): String = when (platform) {
 
 val hostPlatform = detectPlatform()
 val platform = System.getenv("FGKL_PLATFORM") ?: hostPlatform
+val rustTargetTriple = rustTarget(platform) // validates the platform string up front
 val crossCompiling = platform != hostPlatform
 val libFileName = when {
     platform.startsWith("osx") -> "libfgkl.dylib"
     platform.startsWith("linux") -> "libfgkl.so"
     else -> "fgkl.dll"
 }
-val cargoOutputDir = if (crossCompiling) file("target/${rustTarget(platform)}/release") else file("target/release")
-val nativeOutputDir = file("src/main/resources/native/$platform")
+val cargoOutputDir = if (crossCompiling) file("target/$rustTargetTriple/release") else file("target/release")
+val nativeDir = layout.buildDirectory.dir("native")
 
 val buildNative by tasks.registering(Exec::class) {
-    description = "Builds the fgkl JNI library with cargo and copies it into the resources tree."
-    inputs.files(fileTree("crates") { exclude("**/target/**") }, "Cargo.toml", "Cargo.lock")
-    outputs.file(nativeOutputDir.resolve(libFileName))
+    description = "Builds the fgkl JNI library with cargo into build/native/<platform>/."
+    inputs.files(fileTree("crates") { exclude("**/target/**") }, "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml")
+    inputs.property("platform", platform)
+    outputs.file(nativeDir.map { it.file("$platform/$libFileName") })
 
-    // Skip when the library was provided some other way, e.g. downloaded from CI.
-    onlyIf { !nativeOutputDir.resolve(libFileName).exists() || !gradle.startParameter.isOffline }
-
-    val cargoArgs = mutableListOf("cargo", "build", "--release", "-p", "fgkl-jni")
-    if (crossCompiling) cargoArgs.addAll(listOf("--target", rustTarget(platform)))
+    val cargoArgs = mutableListOf("cargo", "build", "--release", "--locked", "-p", "fgkl-jni")
+    if (crossCompiling) cargoArgs.addAll(listOf("--target", rustTargetTriple))
     commandLine(cargoArgs)
 
     doLast {
-        nativeOutputDir.mkdirs()
         val built = cargoOutputDir.resolve(libFileName)
         require(built.exists()) { "cargo did not produce $built" }
-        built.copyTo(nativeOutputDir.resolve(libFileName), overwrite = true)
+        val out = nativeDir.get().dir(platform).asFile
+        out.mkdirs()
+        built.copyTo(out.resolve(libFileName), overwrite = true)
     }
 }
 
-tasks.named("processResources") {
+tasks.processResources {
     dependsOn(buildNative)
-}
-
-tasks.named("sourcesJar") {
-    dependsOn(buildNative)
+    from(nativeDir) { into("native") }
 }

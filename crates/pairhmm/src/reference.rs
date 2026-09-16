@@ -1,5 +1,6 @@
-//! Scalar double-precision PairHMM, a direct port of GATK's `LoglessPairHMM`. It is the oracle for
-//! the vectorized kernels and is deliberately written to mirror the Java operation order.
+//! Scalar double-precision PairHMM, a direct port of GATK's `LoglessPairHMM` (Broad Institute,
+//! Apache-2.0; see NOTICE). It is the oracle for the vectorized kernels and is deliberately written
+//! to mirror the Java operation order.
 
 use crate::ReadRef;
 use crate::model::{

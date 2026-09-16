@@ -6,12 +6,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# A JNI cdylib has no crates.io audience.
+publish = false
 
 [lib]
 name = "fgkl"
 crate-type = ["cdylib"]
 
 [dependencies]
-fgkl-pairhmm = { path = "../pairhmm" }
-fgkl-smithwaterman = { path = "../smithwaterman" }
+fgkl-pairhmm = { path = "../pairhmm", version = "0.1.0" }
+fgkl-smithwaterman = { path = "../smithwaterman", version = "0.1.0" }
 jni = "0.21"

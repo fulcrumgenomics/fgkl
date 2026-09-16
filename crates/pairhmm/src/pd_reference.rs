@@ -13,30 +13,8 @@ use crate::model::{
     DELETION_TO_DELETION, INDEL_TO_MATCH, INSERTION_TO_INSERTION, MATCH_TO_DELETION,
     MATCH_TO_INSERTION, MATCH_TO_MATCH, NUM_TRANSITIONS, TABLES,
 };
+use crate::pd::{DEL_END, DEL_START, base_matches_pd};
 use crate::reference::{INITIAL_CONDITION, initial_condition_log10};
-
-/// Flag bits of a partially determined haplotype base (GATK's `PartiallyDeterminedHaplotype`).
-pub const SNP: u8 = 1;
-pub const DEL_START: u8 = 2;
-pub const DEL_END: u8 = 4;
-pub const ALT_A: u8 = 8;
-pub const ALT_C: u8 = 16;
-pub const ALT_G: u8 = 32;
-pub const ALT_T: u8 = 64;
-
-/// Whether a read base matches the alternate SNP alleles encoded in a haplotype flag byte.
-pub fn base_matches_pd(read_base: u8, flags: u8) -> bool {
-    if flags & SNP == 0 {
-        return false;
-    }
-    match read_base {
-        b'A' | b'a' => flags & ALT_A != 0,
-        b'C' | b'c' => flags & ALT_C != 0,
-        b'G' | b'g' => flags & ALT_G != 0,
-        b'T' | b't' => flags & ALT_T != 0,
-        _ => false,
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -48,7 +26,7 @@ enum State {
 /// The log10 likelihood of `read` given the partially determined haplotype `(bases, flags)`,
 /// computed exactly as GATK's `LoglessPDPairHMM` does for a haplotype computed from its first
 /// column, including the deletion state carried from the end of one row into the next.
-pub fn reference_log10_likelihood(bases: &[u8], flags: &[u8], read: &ReadRef<'_>) -> f64 {
+pub fn log10_likelihood(bases: &[u8], flags: &[u8], read: &ReadRef<'_>) -> f64 {
     assert_eq!(bases.len(), flags.len());
     let rows = read.len() + 1;
     let cols = bases.len() + 1;
@@ -142,6 +120,7 @@ pub fn reference_log10_likelihood(bases: &[u8], flags: &[u8], read: &ReadRef<'_>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pd::{ALT_A, ALT_C, ALT_G, ALT_T, SNP};
     use crate::reference;
     use crate::synthetic::Read;
 
@@ -160,7 +139,7 @@ mod tests {
         let hap = b"ACGTTGCAAGGCTTAGGCTTACG";
         let r = read(b"GTTGCAAGGCTTAG");
         let flags = vec![0u8; hap.len()];
-        let pd = reference_log10_likelihood(hap, &flags, &r.as_ref());
+        let pd = log10_likelihood(hap, &flags, &r.as_ref());
         let plain = reference::log10_likelihood(hap, &r.as_ref());
         assert!((pd - plain).abs() < 1e-12, "{pd} vs {plain}");
     }
@@ -172,9 +151,9 @@ mod tests {
         let mut flags = vec![0u8; hap.len()];
         // Position 8 (the second A of CAAG) may also be T.
         flags[8] = SNP | ALT_T;
-        let with = reference_log10_likelihood(hap, &flags, &alt_read.as_ref());
-        let without = reference_log10_likelihood(hap, &vec![0u8; hap.len()], &alt_read.as_ref());
-        let exact = reference_log10_likelihood(hap, &flags, &read(b"GTTGCAAGGCTTAG").as_ref());
+        let with = log10_likelihood(hap, &flags, &alt_read.as_ref());
+        let without = log10_likelihood(hap, &vec![0u8; hap.len()], &alt_read.as_ref());
+        let exact = log10_likelihood(hap, &flags, &read(b"GTTGCAAGGCTTAG").as_ref());
         // With the flag the mismatch penalty disappears: the alternate read scores within a
         // fraction of a log10 unit of the exact read, instead of several units below it.
         assert!(with > without + 1.0, "{with} vs {without}");
@@ -189,8 +168,8 @@ mod tests {
         let mut flags = vec![0u8; hap.len()];
         flags[7] = DEL_START;
         flags[10] = DEL_END;
-        let with = reference_log10_likelihood(hap, &flags, &r.as_ref());
-        let without = reference_log10_likelihood(hap, &vec![0u8; hap.len()], &r.as_ref());
+        let with = log10_likelihood(hap, &flags, &r.as_ref());
+        let without = log10_likelihood(hap, &vec![0u8; hap.len()], &r.as_ref());
         assert!(with > without, "{with} vs {without}");
     }
 
