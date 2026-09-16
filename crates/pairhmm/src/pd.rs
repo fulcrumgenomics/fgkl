@@ -3,8 +3,8 @@
 //!
 //! The batching mirrors [`PairHmm`](crate::PairHmm): reads fill SIMD lanes, single precision is
 //! the default with double-precision recomputation of any pair that underflows, and every call
-//! runs on the calling thread. Haplotype columns are not shared, so haplotypes are computed in
-//! the caller's order.
+//! runs on the calling thread, and haplotypes sharing a prefix of bases and flags share its DP
+//! columns.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -153,8 +153,9 @@ impl PdPairHmm {
             }
         }
         for (pos, &read) in read_order.iter().enumerate() {
-            out[read * n_haps..(read + 1) * n_haps]
-                .copy_from_slice(&tmp[pos * n_haps..(pos + 1) * n_haps]);
+            for (k, &hap) in haps.order.iter().enumerate() {
+                out[read * n_haps + hap] = tmp[pos * n_haps + k];
+            }
         }
         Ok(())
     }
@@ -212,8 +213,10 @@ impl PdPairHmm {
         })
     }
 
-    /// Recomputes the given `(read, haplotype)` pairs in double precision, one haplotype at a
-    /// time with its reads packed into lanes.
+    /// Recomputes the given `(read, sorted haplotype)` pairs in double precision. A read that
+    /// underflowed against a third or more of the haplotypes is run against all of them in one
+    /// prefix-shared sweep; the other pairs are grouped by haplotype and run one haplotype at a
+    /// time with their reads packed into lanes.
     fn run_fallback(
         &self,
         pairs: &[(usize, usize)],
@@ -222,9 +225,31 @@ impl PdPairHmm {
         tmp: &mut [f64],
     ) {
         let n_haps = haps.len();
-        let mut by_hap: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        let mut per_read: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for &(r, h) in pairs {
-            by_hap.entry(h).or_default().push(r);
+            per_read.entry(r).or_default().push(h);
+        }
+        let dense: Vec<usize> =
+            per_read.iter().filter(|(_, hs)| hs.len() * 3 >= n_haps).map(|(&r, _)| r).collect();
+        if !dense.is_empty() {
+            let batch: Vec<ReadRef<'_>> = dense.iter().map(|&r| reads[r]).collect();
+            let mut out = vec![0.0f64; batch.len() * n_haps];
+            let none = self.run_pass(Precision::Double, &batch, haps, &mut out);
+            debug_assert!(none.is_empty(), "double precision never falls back");
+            for (i, &r) in dense.iter().enumerate() {
+                for &h in &per_read[&r] {
+                    tmp[r * n_haps + h] = out[i * n_haps + h];
+                }
+            }
+            for r in &dense {
+                per_read.remove(r);
+            }
+        }
+        let mut by_hap: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (&r, hs) in &per_read {
+            for &h in hs {
+                by_hap.entry(h).or_default().push(r);
+            }
         }
         let key = RunnerKey { backend: self.backend, precision: Precision::Double, wide: false };
         with_pd_runner(key, |runner| {
@@ -437,6 +462,74 @@ mod tests {
         for backend in Backend::available() {
             let out = compute(&config(backend, Precision::Double), &reads, &haps);
             assert_close(&out, &expected, 1e-9, backend.name());
+        }
+    }
+
+    #[test]
+    fn prefix_sharing_handles_nested_prefixes_lengths_and_flag_splits() {
+        // Sorted by (row-end state, bases+flags): haplotypes sharing bases diverge where their
+        // flags differ, a deletion ending on the last column moves a haplotype to another end
+        // state, and lengths differ so snapshots are rescaled.
+        let base = b"ACGTTGCAAGGCTTAGGCTTACGATCGATTACAGGT";
+        let n = base.len();
+        let plain = vec![0u8; n];
+        let mut snp_early = plain.clone();
+        snp_early[5] = SNP | ALT_T;
+        let mut snp_late = plain.clone();
+        snp_late[30] = SNP | ALT_C;
+        let mut del_mid = plain.clone();
+        del_mid[12] = DEL_START;
+        del_mid[15] = DEL_END;
+        let mut del_mid_and_snp = del_mid.clone();
+        del_mid_and_snp[25] = SNP | ALT_G;
+        let mut del_last = plain.clone();
+        del_last[n - 2] = DEL_START;
+        del_last[n - 1] = DEL_END;
+        let short: &[u8] = &base[..20];
+        let mut short_del = vec![0u8; 20];
+        short_del[12] = DEL_START;
+        short_del[15] = DEL_END;
+        let longer: Vec<u8> = [&base[..], b"ACGTAC"].concat();
+        let mut longer_flags = vec![0u8; longer.len()];
+        longer_flags[12] = DEL_START;
+        longer_flags[15] = DEL_END;
+        let haps: Vec<PdHaplotype<'_>> = vec![
+            PdHaplotype { bases: base, flags: &del_last },
+            PdHaplotype { bases: base, flags: &snp_late },
+            PdHaplotype { bases: short, flags: &short_del },
+            PdHaplotype { bases: base, flags: &plain },
+            PdHaplotype { bases: base, flags: &del_mid_and_snp },
+            PdHaplotype { bases: &longer, flags: &longer_flags },
+            PdHaplotype { bases: base, flags: &del_mid },
+            PdHaplotype { bases: base, flags: &snp_early },
+            PdHaplotype { bases: base, flags: &plain },
+        ];
+        let region = PdRegion::generate(13, 40, 30, 1, 36);
+        let reads = region.read_refs();
+        let expected = reference_all(&reads, &haps);
+        for backend in Backend::available() {
+            let out = compute(&config(backend, Precision::Double), &reads, &haps);
+            assert_close(&out, &expected, 1e-9, backend.name());
+            let out = compute(&config(backend, Precision::Float), &reads, &haps);
+            assert_close(&out, &expected, 1e-4, backend.name());
+        }
+    }
+
+    #[test]
+    fn haplotype_order_does_not_change_results() {
+        let region = region();
+        let reads = region.read_refs();
+        let mut haps = region.haplotype_refs();
+        let cfg = Config { precision: Precision::Double, ..Config::default() };
+        let forward = compute(&cfg, &reads, &haps);
+        haps.reverse();
+        let reversed = compute(&cfg, &reads, &haps);
+        let n = haps.len();
+        for r in 0..reads.len() {
+            for h in 0..n {
+                let (a, b) = (forward[r * n + h], reversed[r * n + (n - 1 - h)]);
+                assert!((a - b).abs() < 1e-11, "read {r} hap {h}: {a} vs {b}");
+            }
         }
     }
 
