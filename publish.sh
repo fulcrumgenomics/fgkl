@@ -77,9 +77,10 @@ ls -la build/native/*/
 # The host build would overwrite build/native/osx-aarch64 with the same bytes; skip it and
 # package what was just built.
 ./gradlew build -x buildNative
-jar=$(ls build/libs/fgkl-*.jar | grep -vE 'sources|javadoc')
+# Name the JARs by version: build/libs may still hold JARs of other versions from earlier builds.
+jar=build/libs/fgkl-$version.jar
 unzip -l "$jar" | grep native/ || { echo "no native libraries in $jar" >&2; exit 1; }
-if unzip -l build/libs/fgkl-*-sources.jar | grep -q native/; then
+if unzip -l "build/libs/fgkl-$version-sources.jar" | grep -q native/; then
   echo "sources JAR contains a native library" >&2; exit 1
 fi
 
