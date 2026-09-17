@@ -1,9 +1,30 @@
 plugins {
     `java-library`
+    `maven-publish`
+    signing
+    id("pl.allegro.tech.build.axion-release") version "1.21.1"
+    id("io.github.gradle-nexus.publish-plugin") version "2.0.0"
 }
 
 group = "com.fulcrumgenomics"
-version = "0.1.0-SNAPSHOT"
+
+// The version comes from git tags (v0.1.0 etc.), which `cargo release` creates after bumping the
+// Cargo workspace version, so the JAR and the crates always carry the same number. Between tags
+// the version is the next patch with -SNAPSHOT.
+scmVersion {
+    tag {
+        prefix.set("v")
+        versionSeparator.set("")
+    }
+    versionIncrementer("incrementPatch")
+}
+version = scmVersion.version
+
+tasks.register("printVersion") {
+    description = "Prints the version derived from git tags, for publish.sh."
+    val v = version.toString()
+    doLast { println(v) }
+}
 
 java {
     // Compile against the JDK 17 API, not merely at source level 17, so the JAR cannot pick up
@@ -117,4 +138,59 @@ val buildNative by tasks.registering(Exec::class) {
 tasks.processResources {
     dependsOn(buildNative)
     from(nativeDir) { into("native") }
+}
+
+// ---------------------------------------------------------------------------
+// Publishing to Maven Central (Sonatype Central Portal). Snapshots go unsigned to the snapshot
+// repository; releases are signed with the PGP key in the environment. Driven by publish.sh.
+// ---------------------------------------------------------------------------
+
+publishing {
+    publications {
+        create<MavenPublication>("mavenJava") {
+            from(components["java"])
+            pom {
+                name.set("fgkl")
+                description.set("Native PairHMM, partially determined PairHMM and Smith-Waterman kernels for GATK, in Rust")
+                url.set("https://github.com/fulcrumgenomics/fgkl")
+                licenses {
+                    license {
+                        name.set("MIT License")
+                        url.set("https://opensource.org/licenses/MIT")
+                    }
+                }
+                developers {
+                    developer {
+                        id.set("tfenne")
+                        name.set("Tim Fennell")
+                    }
+                }
+                scm {
+                    connection.set("scm:git:git://github.com/fulcrumgenomics/fgkl.git")
+                    developerConnection.set("scm:git:ssh://github.com/fulcrumgenomics/fgkl.git")
+                    url.set("https://github.com/fulcrumgenomics/fgkl")
+                }
+            }
+        }
+    }
+}
+
+nexusPublishing {
+    repositories {
+        sonatype {
+            nexusUrl.set(uri("https://ossrh-staging-api.central.sonatype.com/service/local/"))
+            snapshotRepositoryUrl.set(uri("https://central.sonatype.com/repository/maven-snapshots/"))
+            username.set(providers.environmentVariable("SONATYPE_USER"))
+            password.set(providers.environmentVariable("SONATYPE_PASS"))
+        }
+    }
+}
+
+signing {
+    val signingKey = providers.environmentVariable("PGP_SECRET")
+    val signingPassword = providers.environmentVariable("PGP_PASSPHRASE")
+    if (signingKey.isPresent && !version.toString().endsWith("-SNAPSHOT")) {
+        useInMemoryPgpKeys(signingKey.get(), signingPassword.getOrElse(""))
+        sign(publishing.publications["mavenJava"])
+    }
 }
