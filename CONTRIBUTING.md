@@ -75,4 +75,5 @@ cargo release patch --execute   # bump, commit, tag vX.Y.Z (nothing goes to crat
 git push && git push --tags
 ./publish.sh                    # build, test, publish: a release when HEAD is tagged, else a snapshot
 ./publish.sh --dry-run          # everything except the upload
+./publish.sh --force            # from a branch: publishes a snapshot named after the branch
 ```
