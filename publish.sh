@@ -28,6 +28,8 @@ for tool in cargo cargo-zigbuild zig docker java; do
   command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }
 done
 [[ -z "$(git status --porcelain)" ]] || { echo "working tree is not clean" >&2; exit 1; }
+# Snapshot versions derived from a branch carry the branch name; only main publishes.
+[[ "$(git rev-parse --abbrev-ref HEAD)" == main ]] || { echo "publish from main (snapshots on other branches carry the branch name)" >&2; exit 1; }
 
 version=$(./gradlew -q printVersion)
 echo "publishing version $version"
