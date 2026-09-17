@@ -1,0 +1,9 @@
+# cargo-release: bump the workspace version, commit and tag; nothing is published to crates.io.
+# `./gradlew` reads the same version back from the tag. Usage: cargo release patch --execute
+publish = false
+shared-version = true
+consolidate-commits = true
+tag-prefix = ""
+tag-name = "v{{version}}"
+pre-release-commit-message = "Release {{version}}"
+push = false

@@ -1,0 +1,24 @@
+name: Windows check
+
+# Manual only: Windows runners cost double minutes and the release script cannot test the
+# Windows library itself. Run this before a release that changes the native code.
+on:
+  workflow_dispatch:
+
+jobs:
+  java:
+    name: Java (windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew build
+        shell: bash
