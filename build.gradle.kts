@@ -142,7 +142,9 @@ tasks.processResources {
 
 // ---------------------------------------------------------------------------
 // Publishing to Maven Central (Sonatype Central Portal). Snapshots go unsigned to the snapshot
-// repository; releases are signed with the PGP key in the environment. Driven by publish.sh.
+// repository; releases are signed. Sonatype credentials come from the environment (SONATYPE_USER,
+// SONATYPE_PASS) or, when unset, from the Gradle properties sonatypeUsername and sonatypePassword
+// in ~/.gradle/gradle.properties on a maintainer's machine. Driven by publish.sh.
 // ---------------------------------------------------------------------------
 
 publishing {
@@ -180,17 +182,25 @@ nexusPublishing {
         sonatype {
             nexusUrl.set(uri("https://ossrh-staging-api.central.sonatype.com/service/local/"))
             snapshotRepositoryUrl.set(uri("https://central.sonatype.com/repository/maven-snapshots/"))
-            username.set(providers.environmentVariable("SONATYPE_USER"))
-            password.set(providers.environmentVariable("SONATYPE_PASS"))
+            username.set(providers.environmentVariable("SONATYPE_USER").orElse(providers.gradleProperty("sonatypeUsername")))
+            password.set(providers.environmentVariable("SONATYPE_PASS").orElse(providers.gradleProperty("sonatypePassword")))
         }
     }
 }
 
 signing {
-    val signingKey = providers.environmentVariable("PGP_SECRET")
-    val signingPassword = providers.environmentVariable("PGP_PASSPHRASE")
-    if (signingKey.isPresent && !version.toString().endsWith("-SNAPSHOT")) {
-        useInMemoryPgpKeys(signingKey.get(), signingPassword.getOrElse(""))
+    // Releases are signed; snapshots are not (Central rejects signed snapshots). The key comes
+    // from PGP_SECRET / signingKey when given, otherwise from the local gpg with its default key
+    // (or the one named by the standard `signing.gnupg.keyName` property), with gpg-agent
+    // supplying the passphrase.
+    val signingKey = providers.environmentVariable("PGP_SECRET").orElse(providers.gradleProperty("signingKey"))
+    val signingPassword = providers.environmentVariable("PGP_PASSPHRASE").orElse(providers.gradleProperty("signingPassword"))
+    if (!version.toString().endsWith("-SNAPSHOT")) {
+        if (signingKey.isPresent) {
+            useInMemoryPgpKeys(signingKey.get(), signingPassword.getOrElse(""))
+        } else {
+            useGpgCmd()
+        }
         sign(publishing.publications["mavenJava"])
     }
 }

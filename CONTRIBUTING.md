@@ -57,7 +57,16 @@ Kernel code that touches vector types must be `#[inline(always)]`, because it is
 
 ## Releasing
 
-Releases must be made with user-supplied Sonatype credentials (`SONATYPE_USER`, `SONATYPE_PASS`) and, for non-snapshot versions, a PGP signing key (`PGP_SECRET`, `PGP_PASSPHRASE`) in the environment. `publish.sh` cross-compiles the native library for linux-x86_64, linux-aarch64, osx-x86_64, osx-aarch64 and windows-x86_64, assembles the JAR, runs the Java tests against the Linux libraries in Docker, and publishes to Maven Central. The Windows library is built but not tested by the script; the manually triggered `windows` workflow on GitHub runs the Java tests on a Windows runner when needed.
+Releases must be made with user-supplied Sonatype credentials: either export `SONATYPE_USER` and `SONATYPE_PASS` (a Central Portal user token pair) or put them once in `~/.gradle/gradle.properties` (mode 600), which Gradle reads automatically:
+
+```
+sonatypeUsername=<Central Portal user token name>
+sonatypePassword=<Central Portal user token password>
+```
+
+Non-snapshot releases are signed with your local `gpg` and its default secret key (set `signing.gnupg.keyName=<key id>` in the same file to pick another), with gpg-agent asking for the passphrase; the key's public half must be on a key server Central can reach. Setting `PGP_SECRET` (ASCII-armoured secret key) and `PGP_PASSPHRASE`, or the `signingKey` and `signingPassword` properties, signs in-process instead. Snapshots are not signed.
+
+`publish.sh` cross-compiles the native library for linux-x86_64, linux-aarch64, osx-x86_64, osx-aarch64 and windows-x86_64, assembles the JAR, runs the Java tests against the Linux libraries in Docker, and publishes to Maven Central. The Windows library is built but not tested by the script; the manually triggered `windows` workflow on GitHub runs the Java tests on a Windows runner when needed.
 
 The version lives in `Cargo.toml` and is bumped and tagged by `cargo release`; Gradle reads the same version from the tag, and commits between tags publish as the next patch version with `-SNAPSHOT`.
 
@@ -66,4 +75,5 @@ cargo release patch --execute   # bump, commit, tag vX.Y.Z (nothing goes to crat
 git push && git push --tags
 ./publish.sh                    # build, test, publish: a release when HEAD is tagged, else a snapshot
 ./publish.sh --dry-run          # everything except the upload
+./publish.sh --force            # from a branch: publishes a snapshot named after the branch
 ```
