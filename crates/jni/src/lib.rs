@@ -253,6 +253,21 @@ pub extern "system" fn Java_com_fulcrumgenomics_fgkl_pdhmm_FgklPdHmm_computeNati
         .resolve::<Throw>()
 }
 
+/// `FgklSmithWaterman.backendNative()`: the name of the aligner backend selected for this CPU.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_fulcrumgenomics_fgkl_smithwaterman_FgklSmithWaterman_backendNative<
+    'local,
+>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> JObject<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JObject<'local>, Failure> {
+            Ok(env.new_string(fgkl_smithwaterman::Backend::detect().name())?.into())
+        })
+        .resolve::<Throw>()
+}
+
 /// `FgklSmithWaterman.alignNative(...)`: returns the CIGAR string and writes the alignment offset
 /// into `offset[0]`. `strategy` is the code `FgklSmithWaterman` assigns to each
 /// `SWOverhangStrategy`.

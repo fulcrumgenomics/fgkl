@@ -44,10 +44,13 @@ public final class FgklSmithWaterman implements SWAlignerNativeBinding {
     @Override
     public void close() {}
 
-    /**
-     * Returns the CIGAR string and stores the alignment offset in {@code offset[0]}. The strategy
-     * is the code {@link #strategyCode} assigns: 0 SOFTCLIP, 1 INDEL, 2 LEADING_INDEL, 3 IGNORE.
-     */
+    /** Name of the vector instruction set the native aligner will use on this CPU. */
+    public String backend() {
+        return backendNative();
+    }
+
+    private static native String backendNative();
+
     /** Maps the strategy to the code the native side expects, independent of the enum's ordinal order. */
     static int strategyCode(SWOverhangStrategy strategy) {
         switch (strategy) {
@@ -59,5 +62,9 @@ public final class FgklSmithWaterman implements SWAlignerNativeBinding {
         }
     }
 
+    /**
+     * Returns the CIGAR string and stores the alignment offset in {@code offset[0]}. The strategy
+     * is the code {@link #strategyCode} assigns: 0 SOFTCLIP, 1 INDEL, 2 LEADING_INDEL, 3 IGNORE.
+     */
     private static native String alignNative(byte[] reference, byte[] alternate, int match, int mismatch, int gapOpen, int gapExtend, int strategy, int[] offset);
 }

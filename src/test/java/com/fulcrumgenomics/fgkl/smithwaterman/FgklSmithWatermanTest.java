@@ -1,6 +1,7 @@
 package com.fulcrumgenomics.fgkl.smithwaterman;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -73,6 +74,11 @@ class FgklSmithWatermanTest {
         String what = strategy + " ref=" + new String(ref) + " alt=" + new String(alt);
         assertEquals(expected.cigar, actual.cigar, what);
         assertEquals(expected.offset, actual.alignment_offset, what);
+    }
+
+    @Test
+    void backendIsReported() {
+        assertNotNull(aligner().backend());
     }
 
     @Test
