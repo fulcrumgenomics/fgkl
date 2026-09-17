@@ -4,8 +4,9 @@
 #
 # Runs on a macOS aarch64 machine with: the pinned Rust toolchain plus the targets below, zig and
 # cargo-zigbuild (Linux cross-compilation), Docker (Linux test runs), JDK 17, and credentials as
-# environment variables (SONATYPE_USER, SONATYPE_PASS and, for a release, PGP_SECRET and
-# PGP_PASSPHRASE) or as the equivalent Gradle properties in ~/.gradle/gradle.properties.
+# environment variables (SONATYPE_USER, SONATYPE_PASS) or the equivalent Gradle properties in
+# ~/.gradle/gradle.properties; releases are signed with the local gpg's default key unless
+# PGP_SECRET / PGP_PASSPHRASE (or the signingKey properties) are given.
 #
 # Usage: publish.sh [--dry-run]     (--dry-run does everything except the upload)
 set -euo pipefail
@@ -36,8 +37,9 @@ echo "publishing version $version"
 if [[ "$version" != *-SNAPSHOT ]]; then
   cargo_version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
   [[ "$version" == "$cargo_version" ]] || { echo "tag version $version != Cargo version $cargo_version" >&2; exit 1; }
-  if [[ -z "${PGP_SECRET:-}" ]] && ! grep -qs '^signingKey=' "$HOME/.gradle/gradle.properties"; then
-    echo "a release needs PGP_SECRET in the environment or signingKey in ~/.gradle/gradle.properties" >&2; exit 1
+  if [[ -z "${PGP_SECRET:-}" ]] && ! grep -qs '^signingKey=' "$HOME/.gradle/gradle.properties" \
+     && ! gpg --list-secret-keys 2>/dev/null | grep -q '^sec'; then
+    echo "a release needs a signing key: PGP_SECRET, signingKey in ~/.gradle/gradle.properties, or a gpg secret key" >&2; exit 1
   fi
 fi
 
