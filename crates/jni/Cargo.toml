@@ -16,4 +16,4 @@ crate-type = ["cdylib"]
 [dependencies]
 fgkl-pairhmm = { path = "../pairhmm", version = "0.1.0" }
 fgkl-smithwaterman = { path = "../smithwaterman", version = "0.1.0" }
-jni = "0.21"
+jni = "0.22"

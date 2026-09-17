@@ -2,7 +2,7 @@ plugins {
     `java-library`
     `maven-publish`
     signing
-    id("pl.allegro.tech.build.axion-release") version "1.21.1"
+    id("pl.allegro.tech.build.axion-release") version "1.21.3"
     id("io.github.gradle-nexus.publish-plugin") version "2.0.0"
 }
 
@@ -40,7 +40,7 @@ repositories {
 
 dependencies {
     api("org.broadinstitute:gatk-native-bindings:1.1.0")
-    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+    testImplementation("org.junit.jupiter:junit-jupiter:6.1.3")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
