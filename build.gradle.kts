@@ -142,7 +142,10 @@ tasks.processResources {
 
 // ---------------------------------------------------------------------------
 // Publishing to Maven Central (Sonatype Central Portal). Snapshots go unsigned to the snapshot
-// repository; releases are signed with the PGP key in the environment. Driven by publish.sh.
+// repository; releases are signed. Credentials come from the environment (SONATYPE_USER,
+// SONATYPE_PASS, PGP_SECRET, PGP_PASSPHRASE) or, when those are unset, from the Gradle properties
+// sonatypeUsername, sonatypePassword, signingKey and signingPassword, which live in
+// ~/.gradle/gradle.properties on a maintainer's machine. Driven by publish.sh.
 // ---------------------------------------------------------------------------
 
 publishing {
@@ -180,15 +183,15 @@ nexusPublishing {
         sonatype {
             nexusUrl.set(uri("https://ossrh-staging-api.central.sonatype.com/service/local/"))
             snapshotRepositoryUrl.set(uri("https://central.sonatype.com/repository/maven-snapshots/"))
-            username.set(providers.environmentVariable("SONATYPE_USER"))
-            password.set(providers.environmentVariable("SONATYPE_PASS"))
+            username.set(providers.environmentVariable("SONATYPE_USER").orElse(providers.gradleProperty("sonatypeUsername")))
+            password.set(providers.environmentVariable("SONATYPE_PASS").orElse(providers.gradleProperty("sonatypePassword")))
         }
     }
 }
 
 signing {
-    val signingKey = providers.environmentVariable("PGP_SECRET")
-    val signingPassword = providers.environmentVariable("PGP_PASSPHRASE")
+    val signingKey = providers.environmentVariable("PGP_SECRET").orElse(providers.gradleProperty("signingKey"))
+    val signingPassword = providers.environmentVariable("PGP_PASSPHRASE").orElse(providers.gradleProperty("signingPassword"))
     if (signingKey.isPresent && !version.toString().endsWith("-SNAPSHOT")) {
         useInMemoryPgpKeys(signingKey.get(), signingPassword.getOrElse(""))
         sign(publishing.publications["mavenJava"])

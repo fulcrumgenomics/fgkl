@@ -3,8 +3,9 @@
 # publishes it to Maven Central: a release when HEAD carries a version tag, a snapshot otherwise.
 #
 # Runs on a macOS aarch64 machine with: the pinned Rust toolchain plus the targets below, zig and
-# cargo-zigbuild (Linux cross-compilation), Docker (Linux test runs), JDK 17, and the environment
-# variables SONATYPE_USER, SONATYPE_PASS and, for a release, PGP_SECRET and PGP_PASSPHRASE.
+# cargo-zigbuild (Linux cross-compilation), Docker (Linux test runs), JDK 17, and credentials as
+# environment variables (SONATYPE_USER, SONATYPE_PASS and, for a release, PGP_SECRET and
+# PGP_PASSPHRASE) or as the equivalent Gradle properties in ~/.gradle/gradle.properties.
 #
 # Usage: publish.sh [--dry-run]     (--dry-run does everything except the upload)
 set -euo pipefail
@@ -33,7 +34,9 @@ echo "publishing version $version"
 if [[ "$version" != *-SNAPSHOT ]]; then
   cargo_version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
   [[ "$version" == "$cargo_version" ]] || { echo "tag version $version != Cargo version $cargo_version" >&2; exit 1; }
-  [[ -n "${PGP_SECRET:-}" ]] || { echo "PGP_SECRET is required for a release" >&2; exit 1; }
+  if [[ -z "${PGP_SECRET:-}" ]] && ! grep -qs '^signingKey=' "$HOME/.gradle/gradle.properties"; then
+    echo "a release needs PGP_SECRET in the environment or signingKey in ~/.gradle/gradle.properties" >&2; exit 1
+  fi
 fi
 
 rm -rf build/native
