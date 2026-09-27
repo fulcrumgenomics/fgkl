@@ -161,6 +161,9 @@ impl<V: SimdInt> DiagWorkspace<V> {
         params: &SwParameters,
         strategy: OverhangStrategy,
     ) -> Option<(usize, usize, usize)> {
+        // The anti-diagonal bounds below assume both sequences are non-empty, which `Aligner::align`
+        // guarantees by rejecting empty input.
+        debug_assert!(!reference.is_empty() && !alternate.is_empty());
         let l = V::LANES;
         let pad = l;
         let n = reference.len();
