@@ -6,6 +6,7 @@ Notable changes to fgkl, newest first. The format follows [Keep a Changelog](htt
 
 ### Changed
 
+- PairHMM: haplotypes that share a suffix now share work through a backward pass computed once per shared suffix, roughly halving PairHMM kernel time on HaplotypeCaller's assembly regions (1.8-2.4x across NEON, AVX2 and AVX-512). Results stay within tolerance but are not bit-identical to 0.1.0: single-precision likelihoods move by at most 1.7e-6 log10, double-precision ones by at most 6e-14, and no pair enters or leaves the double-precision recomputation.
 - Smith-Waterman: the anti-diagonal fill is 1.3-2.2x faster (2.2x on NEON, 1.6x on AVX2, 1.3-1.6x on AVX-512), checking bounds once per anti-diagonal and no longer clearing the traceback buffer on every call. Alignments are unchanged.
 
 ## [0.1.0] - 2026-09-27
