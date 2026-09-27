@@ -10,6 +10,7 @@
 //! `DIR/<dump stem>.<mode>.f64` (and the recorded GATK values to `<stem>.expected.f64`) so two
 //! platforms' results can be compared pair by pair.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::time::Instant;
 
@@ -20,6 +21,111 @@ struct Region {
     reads: Vec<Read>,
     haps: Vec<Vec<u8>>,
     expected: Vec<f64>,
+}
+
+/// Haplotype columns a region's kernel computes per read base, three ways, with exact duplicates
+/// free in all of them.
+struct SharingEstimate {
+    /// Prefix sharing as the kernel does it today.
+    prefix_only: u64,
+    /// Every distinct haplotype's private middle plus each shared prefix-trie and suffix-trie node
+    /// once, the suffix trie to each haplotype's full shared suffix. Overstates the backward work
+    /// where a haplotype's shared prefix and suffix overlap.
+    naive_bound: u64,
+    /// Forward columns up to each haplotype's cut plus the suffix-trie columns the cuts actually
+    /// read; see [`sharing_estimate`].
+    forward: u64,
+    backward: u64,
+}
+
+/// Shortest backward depth worth a cut: the join costs about two columns.
+const MIN_SAVING: usize = 4;
+
+/// Estimates the columns computed per read base with prefix sharing and with bidirectional
+/// sharing.
+///
+/// With P the longest prefix a haplotype of length m shares with a prefix-order neighbour and S
+/// the longest suffix it shares with a reverse-order neighbour, the suffix can save d =
+/// min(S, m - P - 1) columns. When d >= [`MIN_SAVING`] the haplotype's forward sweep stops before
+/// cut column k = max(P + 1, m - d) and joins the backward values of column k, whose suffix of
+/// length m - k = d the backward pass computes once per distinct suffix. Otherwise the haplotype
+/// runs forward to its end as today. The longest prefix or suffix a string shares with any other
+/// is reached at a sorted neighbour, which gives the trie counts from neighbour LCPs.
+fn sharing_estimate(haps: &[Vec<u8>]) -> SharingEstimate {
+    fn lcp(a: &[u8], b: &[u8]) -> usize {
+        a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    }
+    fn lcs(a: &[u8], b: &[u8]) -> usize {
+        a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count()
+    }
+    /// Per haplotype in `order`: its common length (by `common`) with its predecessor, and the
+    /// longest it shares with either neighbour.
+    fn neighbour_sharing(
+        order: &[&[u8]],
+        common: fn(&[u8], &[u8]) -> usize,
+    ) -> Vec<(usize, usize)> {
+        let with_prev: Vec<usize> = (0..order.len())
+            .map(|k| if k == 0 { 0 } else { common(order[k - 1], order[k]) })
+            .collect();
+        (0..order.len())
+            .map(|k| {
+                let next = if k + 1 < order.len() { with_prev[k + 1] } else { 0 };
+                (with_prev[k], with_prev[k].max(next))
+            })
+            .collect()
+    }
+    let mut distinct: Vec<&[u8]> = haps.iter().map(Vec::as_slice).collect();
+    distinct.sort();
+    distinct.dedup();
+    let prefix = neighbour_sharing(&distinct, lcp);
+    let prefix_only: usize =
+        distinct.iter().zip(&prefix).map(|(h, &(prev, _))| h.len() - prev).sum();
+
+    let mut by_suffix = distinct.clone();
+    by_suffix.sort_by(|a, b| a.iter().rev().cmp(b.iter().rev()));
+    let suffix = neighbour_sharing(&by_suffix, lcs);
+    let longest_suffix: HashMap<&[u8], usize> =
+        by_suffix.iter().zip(&suffix).map(|(&h, &(_, longest))| (h, longest)).collect();
+
+    let middles: usize = distinct
+        .iter()
+        .zip(&prefix)
+        .map(|(h, &(_, p))| h.len().saturating_sub(p + longest_suffix[h]))
+        .sum();
+    let prefix_trie: usize = prefix.iter().map(|&(prev, longest)| longest - prev).sum();
+    let suffix_trie: usize = suffix.iter().map(|&(prev, longest)| longest - prev).sum();
+    let naive_bound = (middles + prefix_trie + suffix_trie).min(prefix_only);
+
+    // Forward: from the resume column (LCP with the predecessor) up to the column before the cut.
+    let mut depth_needed: HashMap<&[u8], usize> = HashMap::new();
+    let mut forward = 0;
+    for (&h, &(prev, p)) in distinct.iter().zip(&prefix) {
+        let m = h.len();
+        let d = if p >= m { 0 } else { longest_suffix[h].min(m - p - 1) };
+        if d >= MIN_SAVING {
+            let cut = (p + 1).max(m - d);
+            forward += cut - 1 - prev;
+            depth_needed.insert(h, m - cut);
+        } else {
+            forward += m - prev;
+        }
+    }
+    // Backward: the union of the needed suffix paths. `reach` is how deep the current suffix path
+    // has been computed by earlier haplotypes in reverse order.
+    let mut backward = 0;
+    let mut reach = 0;
+    for (&h, &(prev, _)) in by_suffix.iter().zip(&suffix) {
+        let need = depth_needed.get(h).copied().unwrap_or(0);
+        let resume = prev.min(reach);
+        backward += need.saturating_sub(resume);
+        reach = resume.max(need);
+    }
+    SharingEstimate {
+        prefix_only: prefix_only as u64,
+        naive_bound: naive_bound as u64,
+        forward: forward as u64,
+        backward: backward as u64,
+    }
 }
 
 fn phred(s: &str) -> Vec<u8> {
@@ -205,26 +311,29 @@ fn main() {
             rb * hb
         })
         .sum();
-    let shared: u64 = regions
-        .iter()
-        .map(|r| {
-            let mut haps: Vec<&[u8]> = r.haps.iter().map(Vec::as_slice).collect();
-            haps.sort();
-            let rb: u64 = r.reads.iter().map(|x| x.bases.len() as u64).sum();
-            let lcp: u64 = haps
-                .windows(2)
-                .map(|w| w[0].iter().zip(w[1]).take_while(|(a, b)| a == b).count() as u64)
-                .sum();
-            rb * lcp
-        })
-        .sum();
+    let [prefix_only, naive_bound, forward, backward] = regions.iter().fold([0u64; 4], |acc, r| {
+        let rb: u64 = r.reads.iter().map(|x| x.bases.len() as u64).sum();
+        let e = sharing_estimate(&r.haps);
+        [e.prefix_only, e.naive_bound, e.forward, e.backward]
+            .map(|c| c * rb)
+            .iter()
+            .zip(acc)
+            .map(|(c, a)| c + a)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap()
+    });
+    let pct = |c: u64| 100.0 * c as f64 / cells as f64;
     println!(
-        "regions={} pairs={} cells={} prefix-shared cells={} ({:.1}%) mean haps/region={:.1} mean reads/region={:.1}",
+        "regions={} pairs={} cells={} computed: prefix sharing {:.1}%, bidirectional {:.1}% (forward {:.1}% + backward {:.1}%), naive bound {:.1}%; mean haps/region={:.1} mean reads/region={:.1}",
         regions.len(),
         pairs,
         cells,
-        shared,
-        100.0 * shared as f64 / cells as f64,
+        pct(prefix_only),
+        pct(forward + backward),
+        pct(forward),
+        pct(backward),
+        pct(naive_bound),
         regions.iter().map(|r| r.haps.len()).sum::<usize>() as f64 / regions.len() as f64,
         regions.iter().map(|r| r.reads.len()).sum::<usize>() as f64 / regions.len() as f64
     );
