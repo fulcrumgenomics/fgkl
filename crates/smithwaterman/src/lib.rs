@@ -965,6 +965,49 @@ mod tests {
     }
 
     #[test]
+    fn a_reused_aligner_matches_the_reference_as_pair_sizes_shrink_and_grow() {
+        let mut rng = Rng(11);
+        // Large unrelated pairs first leave every scratch buffer full of unrelated values.
+        let sizes = [(600, 520), (500, 150), (40, 30), (320, 310), (8, 5), (590, 600), (60, 200)];
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = sizes
+            .iter()
+            .enumerate()
+            .map(|(k, &(r, a))| {
+                if k == 0 {
+                    let reference = (0..r).map(|_| rng.base()).collect();
+                    let alt = (0..a).map(|_| rng.base()).collect();
+                    (reference, alt)
+                } else {
+                    related_pair(&mut rng, r, a)
+                }
+            })
+            .collect();
+        for backend in Backend::available() {
+            for narrow in [true, false] {
+                let mut aligner = Aligner::with_backend(backend).unwrap();
+                if !narrow {
+                    aligner = aligner.without_narrow_lanes();
+                }
+                for (r, a) in &pairs {
+                    for params in [&HAP_TO_REF, &READ_TO_HAP] {
+                        for strategy in STRATEGIES {
+                            let expected = reference::align(r, a, params, strategy);
+                            let actual = aligner.align(r, a, params, strategy).unwrap();
+                            assert_eq!(
+                                actual,
+                                expected,
+                                "{backend} narrow={narrow} {strategy:?} {} x {}",
+                                r.len(),
+                                a.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn buffers_are_reused_across_calls_without_leaking_state() {
         let mut aligner = Aligner::new();
         let mut rng = Rng(3);
