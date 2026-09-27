@@ -638,9 +638,13 @@ impl<S: Simd> Workspace<S> {
         let init = S::splat(S::Elem::from_f64(S::Elem::INITIAL_CONSTANT.to_f64() / hap_len as f64));
         let scale = S::splat(S::Elem::from_f64(src.hap_len as f64 / hap_len as f64));
 
+        // The two rows are swapped as local slices after each row, which stays in registers;
+        // swapping the buffers themselves cost a store-forwarding stall per row on x86.
+        let mut prev: &mut [S::Elem] = &mut row_prev.cells;
+        let mut cur: &mut [S::Elem] = &mut row_cur.cells;
         let stride = FORWARD_STATES * lanes;
         for j in start..=stop {
-            let col = &mut row_prev.cells[j * stride..][..stride];
+            let col = &mut prev[j * stride..][..stride];
             zero.store(col);
             zero.store(&mut col[lanes..]);
             init.store(&mut col[2 * lanes..]);
@@ -671,8 +675,6 @@ impl<S: Simd> Workspace<S> {
                 x_left: S::load(&src_x[i * lanes..]).mul(scale),
                 y_left: S::load(&src_y[i * lanes..]).mul(scale),
             };
-            let prev: &[S::Elem] = &row_prev.cells;
-            let cur: &mut [S::Elem] = &mut row_cur.cells;
             let mut rowsum = zero;
             if end_rows[r] {
                 // A read ends on this row, so every snapshot also needs the row's sum up to its
@@ -749,7 +751,7 @@ impl<S: Simd> Workspace<S> {
                 m.store(&mut join_m[i * lanes..]);
                 y.store(&mut join_y[i * lanes..]);
             }
-            std::mem::swap(row_prev, row_cur);
+            std::mem::swap(&mut prev, &mut cur);
         }
         acc_v.store(acc);
     }
@@ -804,8 +806,11 @@ impl<S: Simd> Workspace<S> {
         let zero = S::zero();
         let scale = S::splat(S::Elem::BACKWARD_SCALE);
         // Nothing lies below the last row.
+        // Swapped as local slices after each row, as in `run_hap`.
+        let mut prev: &mut [S::Elem] = &mut bwd_prev.cells;
+        let mut cur: &mut [S::Elem] = &mut bwd_cur.cells;
         for j in left..right {
-            let col = &mut bwd_prev.cells[j * BACKWARD_STATES * lanes..][..BACKWARD_STATES * lanes];
+            let col = &mut prev[j * BACKWARD_STATES * lanes..][..BACKWARD_STATES * lanes];
             zero.store(col);
             zero.store(&mut col[lanes..]);
         }
@@ -836,8 +841,6 @@ impl<S: Simd> Workspace<S> {
                 by_right: S::load(&start.y[i * lanes..]),
                 bm_last: zero,
             };
-            let prev: &[S::Elem] = &bwd_prev.cells;
-            let cur: &mut [S::Elem] = &mut bwd_cur.cells;
             let mut hi = right;
             for w in 0..=sweep.writes.len() {
                 let (lo, node) = match sweep.writes.get(w) {
@@ -878,7 +881,7 @@ impl<S: Simd> Workspace<S> {
                 }
             }
             if i > 0 {
-                std::mem::swap(bwd_prev, bwd_cur);
+                std::mem::swap(&mut prev, &mut cur);
             }
         }
         self.bwd_nodes[sweep.start] = start;
