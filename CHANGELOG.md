@@ -4,6 +4,8 @@ Notable changes to fgkl, newest first. The format follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-27
+
 ### Changed
 
 - PairHMM: haplotypes that share a suffix now share work through a backward pass computed once per shared suffix, roughly halving PairHMM kernel time on HaplotypeCaller's assembly regions (1.8-2.4x across NEON, AVX2 and AVX-512). Results stay within tolerance but are not bit-identical to 0.1.0: single-precision likelihoods move by at most 1.7e-6 log10, double-precision ones by at most 6e-14, and no pair enters or leaves the double-precision recomputation.
@@ -22,5 +24,6 @@ First release: Rust kernels for GATK behind the `org.broadinstitute:gatk-native-
 - Scalar, NEON, AVX2 and AVX-512 backends chosen at runtime; every call runs on the calling thread.
 - One JAR with native libraries for Linux (x86_64 and aarch64, glibc 2.17), macOS (x86_64 and aarch64) and Windows (x86_64, built but not yet tested in CI).
 
-[Unreleased]: https://github.com/fulcrumgenomics/fgkl/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/fulcrumgenomics/fgkl/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/fulcrumgenomics/fgkl/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/fulcrumgenomics/fgkl/releases/tag/v0.1.0

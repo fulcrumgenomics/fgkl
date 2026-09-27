@@ -8,9 +8,9 @@ plugins {
 
 group = "com.fulcrumgenomics"
 
-// The version comes from git tags (v0.1.0 etc.), which `cargo release` creates after bumping the
-// Cargo workspace version, so the JAR and the crates always carry the same number. Between tags
-// the version is the next patch with -SNAPSHOT.
+// The version comes from git tags (v0.1.0 etc.), made at the commit that bumps the Cargo
+// workspace version, so the JAR and the crates always carry the same number. Between tags the
+// version is the next patch with -SNAPSHOT.
 scmVersion {
     tag {
         prefix.set("v")
