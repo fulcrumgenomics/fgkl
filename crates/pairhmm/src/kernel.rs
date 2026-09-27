@@ -263,7 +263,13 @@ impl HapSet for SortedHaps<'_> {
     }
 
     fn single(&self, k: usize) -> Self {
+        // One haplotype has no suffix to share.
         SortedHaps::new(&[self.bases[k]], false)
+    }
+
+    fn without_suffix_sharing(&self) -> Self {
+        // Sorting is stable and the bases are already sorted, so sorted indices carry over.
+        SortedHaps::new(&self.bases, false)
     }
 
     fn lanes(key: RunnerKey) -> usize {
@@ -396,20 +402,21 @@ impl<S: Simd> Runner<S> {
                 }
             }
             ws.run_hap(start, stop, hap_len, &haps.codes[k], cut.is_some());
-            match cut {
+            let min_accepted = match cut {
                 None => {
-                    for lane in 0..reads.len() {
-                        let raw = ws.acc[lane].to_f64();
-                        out[lane * n_haps + k] = finish_lane::<S::Elem>(raw, lane, k, fallback);
+                    for (lane, raw) in ws.joined.iter_mut().enumerate().take(reads.len()) {
+                        *raw = ws.acc[lane].to_f64();
                     }
+                    S::Elem::MIN_ACCEPTED
                 }
                 Some(cut) => {
                     ws.join(cut.node, hap_len);
-                    for lane in 0..reads.len() {
-                        let raw = ws.joined[lane];
-                        out[lane * n_haps + k] = finish_lane::<S::Elem>(raw, lane, k, fallback);
-                    }
+                    Some(S::Elem::MIN_ACCEPTED_JOINED)
                 }
+            };
+            for lane in 0..reads.len() {
+                out[lane * n_haps + k] =
+                    finish_lane::<S::Elem>(ws.joined[lane], min_accepted, lane, k, fallback);
             }
         }
     }
@@ -608,7 +615,7 @@ struct Workspace<S: Simd> {
     /// column before it.
     join_m: AlignedVec<S::Elem>,
     join_y: AlignedVec<S::Elem>,
-    /// Per lane, the raw result of a haplotype that took a cut.
+    /// Per lane, the raw result of the current haplotype in `f64`, joined or not.
     joined: Vec<f64>,
 }
 
@@ -705,8 +712,8 @@ impl<S: Simd> Workspace<S> {
             }
             self.join_m.resize_no_fill((rows + 1) * lanes);
             self.join_y.resize_no_fill((rows + 1) * lanes);
-            self.joined.resize(lanes, 0.0);
         }
+        self.joined.resize(lanes, 0.0);
     }
 
     /// Fills backward node 0, the last column of every haplotype: from there only trailing
@@ -1014,16 +1021,17 @@ struct RowViewMut<'a, E> {
 }
 
 /// Converts a lane's raw scaled probability for sorted haplotype `k`, computed in precision `E`,
-/// into a log10 likelihood, or records the pair in `fallback` and yields `NaN` when single
-/// precision lost it.
+/// into a log10 likelihood, or records the pair in `fallback` and yields `NaN` when the result
+/// is below `min_accepted` and so may have lost precision.
 #[inline(always)]
 pub(crate) fn finish_lane<E: Float>(
     raw: f64,
+    min_accepted: Option<f64>,
     lane: usize,
     k: usize,
     fallback: &mut Vec<(usize, usize)>,
 ) -> f64 {
-    let lost = match E::MIN_ACCEPTED {
+    let lost = match min_accepted {
         Some(threshold) => raw.is_nan() || raw < threshold,
         None => false,
     };

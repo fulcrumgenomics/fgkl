@@ -86,6 +86,12 @@ pub trait Float:
     /// on a likely path is about the result divided by `INITIAL_CONSTANT`, so single precision
     /// needs it lifted by as much again to stay in the normal range.
     const BACKWARD_SCALE: Self;
+    /// Raw results joined from forward and backward values below this are recomputed without
+    /// suffix sharing. In single precision that is `MIN_ACCEPTED`. In double precision backward
+    /// values are unscaled, since the join's product must fit an `f64`, so they flush below
+    /// about `1e-308`; that loses at most a quarter of the read length in raw units, which stays
+    /// below the last bit of any result above this.
+    const MIN_ACCEPTED_JOINED: f64;
     fn log10_initial_constant() -> f64;
     fn from_f64(v: f64) -> Self;
     fn to_f64(self) -> f64;
@@ -101,6 +107,7 @@ impl Float for f32 {
     const MIN_ACCEPTED: Option<f64> = Some(1e-28);
     // 2^120, like the forward sweep's initial value.
     const BACKWARD_SCALE: f32 = f32::from_bits(0x7B80_0000);
+    const MIN_ACCEPTED_JOINED: f64 = 1e-28;
     #[inline(always)]
     fn log10_initial_constant() -> f64 {
         120.0 * std::f64::consts::LOG10_2
@@ -126,6 +133,8 @@ impl Float for f64 {
     const INITIAL_CONSTANT: f64 = f64::from_bits(0x7FB0_0000_0000_0000);
     const MIN_ACCEPTED: Option<f64> = None;
     const BACKWARD_SCALE: f64 = 1.0;
+    // A likelihood of about 1e-283 once divided by the 2^1020 scale.
+    const MIN_ACCEPTED_JOINED: f64 = 1e24;
     #[inline(always)]
     fn log10_initial_constant() -> f64 {
         1020.0 * std::f64::consts::LOG10_2
