@@ -403,18 +403,16 @@ pub mod neon {
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86 {
-    use super::{Simd, Wide};
+    use super::Simd;
     use core::arch::x86_64::*;
 
-    // AVX2 has 16 vector registers, so a second lane group spills and costs about 15%;
-    // AVX-512's 32 registers hold two groups, which hides FMA latency for a 6% gain.
+    // One vector per lane group on both. A second group spills AVX2's 16 vector registers, and
+    // on AVX-512 it doubles the row buffers a sweep streams through, which on Granite Rapids and
+    // Zen 5 costs more than the FMA latency it hides.
     pub type Avx2F32 = F32x8;
     pub type Avx2F64 = F64x4;
-    pub type Avx512F32 = Wide<F32x16, 2>;
-    pub type Avx512F64 = Wide<F64x8, 2>;
-    /// Single lane group for the reads a region has left over after its full 32-lane batches.
-    pub type Avx512F32Narrow = F32x16;
-    pub type Avx512F64Narrow = F64x8;
+    pub type Avx512F32 = F32x16;
+    pub type Avx512F64 = F64x8;
 
     macro_rules! x86_vector {
         ($name:ident, $reg:ty, $elem:ty, $lanes:expr, $set1:ident, $loadu:ident, $storeu:ident, $add:ident, $mul:ident, $fmadd:ident, $max:ident) => {

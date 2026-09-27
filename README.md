@@ -44,7 +44,7 @@ In double precision the output of 0.1.0 was byte-identical to GATK's Java implem
 
 - **Smith-Waterman** (`com.fulcrumgenomics.fgkl.smithwaterman.FgklSmithWaterman`): implements `SWAlignerNativeBinding` in place of `IntelSmithWaterman`, reproducing GATK's `SmithWatermanJavaAligner` exactly (gap model, tie-breaking, the four overhang strategies, CIGARs and offsets). The matrix is filled along anti-diagonals in SIMD lanes (NEON, AVX2, AVX-512) with one byte of traceback per cell: 16-bit lanes first, holding scores relative to the anti-diagonal so that every step is non-positive and saturation can be detected at the alignment end, and 32-bit lanes for the rare pair that saturates. Setting the environment variable `FGKL_SW_STATS` (to any value) in the process that loads the library makes it print, at process exit, one line per scoring-parameter set with the number of calls, cells, distinct sequence pairs and 16-bit saturation fallbacks.
 
-The backend is chosen at runtime from what the CPU reports: AVX-512 (F, plus BW for the aligner), then AVX2 with FMA, then NEON on aarch64, and otherwise the scalar kernels, which are the same algorithms without vector instructions and run on any x86_64 or aarch64 CPU. Every backend produces results within the documented tolerances of the others.
+The backend is chosen at runtime from what the CPU reports: AVX-512 (F with AVX2 and FMA, plus BW for the aligner), then AVX2 with FMA, then NEON on aarch64, and otherwise the scalar kernels, which are the same algorithms without vector instructions and run on any x86_64 or aarch64 CPU. Every backend produces results within the documented tolerances of the others.
 
 ## Layout
 

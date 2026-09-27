@@ -26,10 +26,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use kernel::SortedHaps;
 
-/// A region's reads left over after its full wide batches use the narrow AVX-512 instantiation
-/// when there are at most this many of them.
-const NARROW_BATCH: usize = 16;
-
 /// One read's bases and per-base penalties, all of the same length.
 #[derive(Clone, Copy, Debug)]
 pub struct ReadRef<'a> {
@@ -119,7 +115,8 @@ pub enum Backend {
     /// One 256-bit AVX2 lane group with FMA.
     #[cfg(target_arch = "x86_64")]
     Avx2,
-    /// Two 512-bit AVX-512 lane groups, with a single-group instantiation for small batches.
+    /// One 512-bit AVX-512 lane group; a region's last few reads, at most half a batch, run on
+    /// 256-bit AVX2 lanes.
     #[cfg(target_arch = "x86_64")]
     Avx512,
 }
@@ -157,12 +154,17 @@ impl Backend {
             #[cfg(target_arch = "x86_64")]
             Backend::Avx2 => is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
             #[cfg(target_arch = "x86_64")]
-            Backend::Avx512 => is_x86_feature_detected!("avx512f"),
+            // The 256-bit instantiation for a region's last reads needs AVX2 and FMA too.
+            Backend::Avx512 => {
+                is_x86_feature_detected!("avx512f")
+                    && is_x86_feature_detected!("avx2")
+                    && is_x86_feature_detected!("fma")
+            }
         }
     }
 
-    /// Whether the kernels have a separate narrow (single lane group) instantiation for this
-    /// backend, used for the reads a region has left over after its full wide batches.
+    /// Whether the kernels have a narrower instantiation for this backend, used for batches
+    /// that would fill at most half a wide one.
     pub(crate) fn has_narrow_instantiation(self) -> bool {
         #[cfg(target_arch = "x86_64")]
         {
@@ -394,6 +396,22 @@ impl Batcher {
         }
     }
 
+    /// The wide and narrow runner keys for `precision`; they select the same instantiation
+    /// except on AVX-512.
+    fn runner_keys(&self, precision: Precision) -> (RunnerKey, RunnerKey) {
+        (
+            RunnerKey { backend: self.backend, precision, wide: true },
+            RunnerKey { backend: self.backend, precision, wide: false },
+        )
+    }
+
+    /// Whether a batch of `n` reads, fewer than a wide batch, runs on the narrow instantiation:
+    /// only on AVX-512, and only when it fills at most the narrow lanes, so a wide batch is never
+    /// left mostly empty.
+    fn fits_narrow<H: HapSet>(&self, precision: Precision, n: usize) -> bool {
+        self.backend.has_narrow_instantiation() && n <= H::lanes(self.runner_keys(precision).1)
+    }
+
     /// Runs every batch of reads against all haplotypes, returning the `(read, sorted
     /// haplotype)` pairs whose result must be recomputed in double precision.
     fn run_pass<H: HapSet>(
@@ -403,17 +421,12 @@ impl Batcher {
         haps: &H,
         tmp: &mut [f64],
     ) -> Vec<(usize, usize)> {
-        let wide = RunnerKey { backend: self.backend, precision, wide: true };
-        let narrow = RunnerKey { backend: self.backend, precision, wide: false };
-        // Full batches run on the wide instantiation; a remainder the narrow one can hold runs
-        // there rather than leaving half the wide lanes empty. Only AVX-512 has both.
+        let (wide, narrow) = self.runner_keys(precision);
+        // Full batches run on the wide instantiation, and a remainder on the narrow one when it
+        // fits there.
         let n = reads.len();
-        let split = if self.backend.has_narrow_instantiation() {
-            let rest = n % H::lanes(wide);
-            if rest <= NARROW_BATCH { n - rest } else { n }
-        } else {
-            n
-        };
+        let rest = n % H::lanes(wide);
+        let split = if self.fits_narrow::<H>(precision, rest) { n - rest } else { n };
         let mut fallback = Vec::new();
         let (head, tail) = tmp.split_at_mut(split * haps.len());
         Self::run_batches(wide, &reads[..split], haps, head, 0, &mut fallback);
@@ -512,13 +525,18 @@ impl Batcher {
                 by_hap.entry(h).or_default().push(r);
             }
         }
-        let key = RunnerKey { backend: self.backend, precision: Precision::Double, wide: false };
-        let lanes = H::lanes(key);
+        let (wide, narrow) = self.runner_keys(Precision::Double);
+        let lanes = H::lanes(wide);
         let mut out = vec![0.0f64; lanes];
         let mut none = Vec::new();
         for (h, read_positions) in by_hap {
             let single = haps.single(h);
             for chunk in read_positions.chunks(lanes) {
+                let key = if self.fits_narrow::<H>(Precision::Double, chunk.len()) {
+                    narrow
+                } else {
+                    wide
+                };
                 let batch: Vec<ReadRef<'_>> = chunk.iter().map(|&p| reads[p]).collect();
                 single.run_batch(key, &batch, &mut out[..batch.len()], &mut none);
                 for (i, &p) in chunk.iter().enumerate() {
@@ -965,6 +983,36 @@ mod tests {
             let solo = compute(&config, &alone, &haps);
             let with_others = compute(&config, &batched, &haps);
             assert_eq!(solo[..], with_others[..solo.len()], "{precision:?}");
+        }
+    }
+
+    #[test]
+    fn a_read_gets_the_same_bits_in_a_full_batch_and_in_a_remainder() {
+        // Read counts around one and two wide batches put a read in a full wide batch, in a
+        // remainder on the narrow instantiation, or in a mostly empty wide batch; lanes are
+        // independent, so each must give every read the bits it gets alone.
+        let region = Region::generate(5, 40, 60, 4, 100);
+        let reads = region.read_refs();
+        let haps = region.haplotype_refs();
+        for backend in Backend::available() {
+            for precision in [Precision::Float, Precision::Double] {
+                let config = Config { precision, backend: Some(backend), ..Config::default() };
+                let solo: Vec<Vec<f64>> = reads
+                    .iter()
+                    .map(|r| compute(&config, std::slice::from_ref(r), &haps))
+                    .collect();
+                let lanes =
+                    |wide| <SortedHaps as HapSet>::lanes(RunnerKey { backend, precision, wide });
+                let (wide, narrow) = (lanes(true), lanes(false));
+                let counts = [wide, wide + narrow, wide + narrow + 1, 2 * wide - 1, 2 * wide + 1];
+                for n in counts.into_iter().filter(|&n| n <= reads.len()) {
+                    let all = compute(&config, &reads[..n], &haps);
+                    for (r, alone) in solo[..n].iter().enumerate() {
+                        let got = &all[r * haps.len()..(r + 1) * haps.len()];
+                        assert_eq!(got, &alone[..], "{backend:?} {precision:?} n={n} read {r}");
+                    }
+                }
+            }
         }
     }
 

@@ -5,6 +5,9 @@
 //!
 //! Usage: pairhmm-replay <pairs.txt> [--backend NAME] [--iters N] [--max-regions N]
 //!        [--only-region N] [--dump-region N FILE] [--write-results DIR] [--no-suffix-sharing]
+//!        [--modes float-nofb,float,double]
+//!
+//! `--modes` runs only the listed modes (default all three), e.g. to profile one of them.
 //!
 //! `--no-suffix-sharing` shares prefixes only, reproducing that kernel's bits.
 //!
@@ -165,6 +168,7 @@ fn main() {
     let mut dump_region: Option<(usize, String)> = None;
     let mut write_results: Option<String> = None;
     let mut share_suffixes = true;
+    let mut only_modes: Option<Vec<String>> = None;
     let mut rest = args[1..].iter();
     let value = |flag: &str, v: Option<&String>| -> String {
         v.cloned().unwrap_or_else(|| panic!("{flag} needs a value"))
@@ -177,6 +181,9 @@ fn main() {
             "--only-region" => only_region = Some(value(flag, rest.next()).parse().unwrap()),
             "--write-results" => write_results = Some(value(flag, rest.next())),
             "--no-suffix-sharing" => share_suffixes = false,
+            "--modes" => {
+                only_modes = Some(value(flag, rest.next()).split(',').map(String::from).collect())
+            }
             "--dump-region" => {
                 let index = value(flag, rest.next()).parse().unwrap();
                 dump_region = Some((index, value(flag, rest.next())));
@@ -241,7 +248,15 @@ fn main() {
         Mode { label: "float", precision: Precision::Float, double_fallback: true },
         Mode { label: "double", precision: Precision::Double, double_fallback: true },
     ];
+    if let Some(only) = &only_modes {
+        for label in only {
+            assert!(modes.iter().any(|m| m.label == label), "unknown mode {label}");
+        }
+    }
     for mode in modes {
+        if only_modes.as_ref().is_some_and(|m| !m.iter().any(|l| l == mode.label)) {
+            continue;
+        }
         let config = Config {
             precision: mode.precision,
             backend,
