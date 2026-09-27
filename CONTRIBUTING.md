@@ -72,12 +72,12 @@ Non-snapshot releases are signed with your local `gpg` and its default secret ke
 
 Before tagging, rename the `Unreleased` section of `CHANGELOG.md` to the new version and date, open a fresh empty `Unreleased` section above it, and update the comparison links at the bottom.
 
-The version lives in `Cargo.toml` and is bumped and tagged by `cargo release`; Gradle reads the same version from the tag, and commits between tags publish as the next patch version with `-SNAPSHOT`.
+The version lives in `Cargo.toml` (the workspace version and the JNI crate's path dependencies); bump it in the same pull request as the changelog. Gradle reads the version from the release tag, which is made by hand on `main` once that pull request has merged, and commits between tags publish as the next patch version with `-SNAPSHOT`.
 
 ```
-cargo release patch --execute   # bump, commit, tag vX.Y.Z (nothing goes to crates.io)
-git push && git push --tags
-./publish.sh                    # build, test, publish: a release when HEAD is tagged, else a snapshot
-./publish.sh --dry-run          # everything except the upload
-./publish.sh --force            # from a branch: publishes a snapshot named after the branch
+git tag -a vX.Y.Z -m "fgkl X.Y.Z"   # on main, at the merged release commit
+./publish.sh --dry-run              # everything except the upload
+git push origin vX.Y.Z
+./publish.sh                        # build, test, publish: a release when HEAD is tagged, else a snapshot
+./publish.sh --force                # from a branch: publishes a snapshot named after the branch
 ```
