@@ -12,11 +12,13 @@ mod model;
 mod pd;
 mod pd_kernel;
 pub mod pd_reference;
+mod plan;
 pub mod reference;
 mod simd;
 pub mod synthetic;
 
 pub use pd::{ALT_A, ALT_C, ALT_G, ALT_T, DEL_END, DEL_START, PdHaplotype, PdPairHmm, SNP};
+pub use plan::SharedColumns;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -287,6 +289,13 @@ impl PairHmm {
         self.inner.compute(reads, &SortedHaps::new(haplotypes, self.share_suffixes), out);
         Ok(())
     }
+}
+
+/// The haplotype columns per read base the PairHMM computes for `haplotypes`, with prefix sharing
+/// alone and with suffix sharing too: a diagnostic of how much work sharing saves.
+pub fn shared_columns(haplotypes: &[&[u8]]) -> SharedColumns {
+    let sorted = SortedHaps::new(haplotypes, true);
+    sorted.plan.columns(&sorted.bases, &sorted.lcp, &sorted.dup)
 }
 
 /// Why a likelihood computation was refused; indices are into the caller's arrays.
@@ -599,8 +608,7 @@ mod tests {
             let config = Config {
                 precision: Precision::Double,
                 backend: Some(backend),
-                double_fallback: true,
-                share_suffixes: true,
+                ..Config::default()
             };
             assert_close(&compute(&config, &reads, &haps), &expected, 1e-9, backend.name());
         }
@@ -612,12 +620,8 @@ mod tests {
         let (reads, haps) = (region.read_refs(), region.haplotype_refs());
         let expected = reference_all(&reads, &haps);
         for backend in Backend::available() {
-            let config = Config {
-                precision: Precision::Float,
-                backend: Some(backend),
-                double_fallback: true,
-                share_suffixes: true,
-            };
+            let config =
+                Config { precision: Precision::Float, backend: Some(backend), ..Config::default() };
             assert_close(&compute(&config, &reads, &haps), &expected, 1e-4, backend.name());
         }
     }
@@ -652,8 +656,7 @@ mod tests {
             let config = Config {
                 precision: Precision::Double,
                 backend: Some(backend),
-                double_fallback: true,
-                share_suffixes: true,
+                ..Config::default()
             };
             assert_close(&compute(&config, &reads, &haps), &expected, 1e-9, backend.name());
         }
@@ -685,8 +688,7 @@ mod tests {
             let config = Config {
                 precision: Precision::Double,
                 backend: Some(backend),
-                double_fallback: true,
-                share_suffixes: true,
+                ..Config::default()
             };
             assert_close(&compute(&config, &reads, &haps), &expected, 1e-9, backend.name());
         }
@@ -712,12 +714,8 @@ mod tests {
         // scaled by 2^120, so the single-precision pass must hand this pair to the f64 kernel.
         assert!(expected[0].is_finite() && expected[0] < -50.0);
         for backend in Backend::available() {
-            let config = Config {
-                precision: Precision::Float,
-                backend: Some(backend),
-                double_fallback: true,
-                share_suffixes: true,
-            };
+            let config =
+                Config { precision: Precision::Float, backend: Some(backend), ..Config::default() };
             assert_close(&compute(&config, &reads, &haps), &expected, 1e-9, backend.name());
         }
     }
@@ -765,16 +763,8 @@ mod tests {
             let mut haps: Vec<Vec<u8>> =
                 vec![(0..6 + rng.below(30)).map(|_| letter(&mut rng)).collect()];
             for _ in 0..rng.below(12) {
-                let mut hap = haps[rng.below(haps.len())].clone();
-                let pos = rng.below(hap.len());
-                match rng.below(3) {
-                    0 => hap[pos] = letter(&mut rng),
-                    1 => hap.insert(pos, letter(&mut rng)),
-                    _ if hap.len() > 1 => {
-                        hap.remove(pos);
-                    }
-                    _ => {}
-                }
+                let from = rng.below(haps.len());
+                let hap = synthetic::edited(&mut rng, b"AC", &haps[from]);
                 haps.push(hap);
             }
             let reads: Vec<synthetic::Read> = (0..1 + rng.below(20))
@@ -801,7 +791,7 @@ mod tests {
 
     #[test]
     fn haplotypes_without_a_cut_keep_their_prefix_only_bits() {
-        let region = suffix_sharing_region();
+        let region = Region::generate(23, 20, 90, 24, 160);
         let (reads, haps) = (region.read_refs(), region.haplotype_refs());
         let sorted = SortedHaps::new(&haps, true);
         let uncut: Vec<usize> = (0..haps.len())

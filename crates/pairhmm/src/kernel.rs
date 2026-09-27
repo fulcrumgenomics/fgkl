@@ -15,12 +15,12 @@
 //! [`SuffixPlan`] and `docs/design.md`).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 use crate::model::{
     DELETION_TO_DELETION, INDEL_TO_MATCH, INSERTION_TO_INSERTION, MATCH_TO_DELETION,
     MATCH_TO_INSERTION, MATCH_TO_MATCH, NUM_TRANSITIONS, TABLES,
 };
+use crate::plan::{BackwardSweep, SuffixPlan};
 use crate::simd::{self, AlignedVec, Float, Simd, with_flush_to_zero};
 use crate::{Backend, HapSet, Precision, ReadRef, RunnerKey};
 
@@ -101,155 +101,6 @@ impl<'a> SortedHaps<'a> {
                 (STANDARD_BASES.len() + p) as u8
             }
         }
-    }
-}
-
-/// A backward sweep must skip at least this many columns of a haplotype's forward sweep to pay
-/// for its join, which costs about two columns.
-const MIN_SAVING: usize = 4;
-
-/// Where a haplotype's forward sweep stops: it computes columns up to `column - 1`, then joins
-/// the backward values of `column`, held in backward node `node`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Cut {
-    pub column: usize,
-    pub node: usize,
-}
-
-/// One backward sweep along a haplotype's suffix, where depth `d` is the haplotype's column
-/// `len - d`. It computes depths `resume + 1..=need` starting from node `start`, which holds depth
-/// `resume`, and stores each `(depth, node)` of `writes` (ascending) for later sweeps and cuts.
-#[derive(Debug)]
-pub(crate) struct BackwardSweep {
-    /// Sorted index of the haplotype whose bases the sweep follows.
-    pub hap: usize,
-    pub resume: usize,
-    pub need: usize,
-    pub start: usize,
-    pub writes: Vec<(usize, usize)>,
-}
-
-/// How a sorted haplotype set shares suffixes: which haplotypes stop their forward sweep at a cut,
-/// and the backward sweeps that compute the values those cuts join, once per shared suffix.
-///
-/// Backward values at a column depend only on the haplotype's bases from that column to its end,
-/// not on its length or prefix. A haplotype whose longest prefix shared with another distinct
-/// haplotype is `p` and longest shared suffix is `s` cuts at column `len - d`, with
-/// `d = min(s, len - p - 1)`: the forward sweep then covers exactly its shared prefix and any
-/// private middle, and the backward pass only goes as deep as the cuts read. Sweeps visit the
-/// haplotypes ordered by reversed bases, each resuming from the deepest depth an earlier sweep
-/// computed along its suffix, so each (suffix, depth) is computed once.
-#[derive(Debug)]
-pub(crate) struct SuffixPlan {
-    /// Per sorted haplotype; `None` runs the forward sweep to the end.
-    pub cuts: Vec<Option<Cut>>,
-    /// In the order they must run.
-    pub sweeps: Vec<BackwardSweep>,
-    /// Backward nodes the plan uses. Node 0 is depth 0, the last column, whose backward values
-    /// depend on the reads alone.
-    pub nodes: usize,
-}
-
-impl SuffixPlan {
-    /// A plan with no cuts: every haplotype runs forward to its end.
-    fn forward_only(num_haps: usize) -> Self {
-        SuffixPlan { cuts: vec![None; num_haps], sweeps: Vec::new(), nodes: 1 }
-    }
-
-    /// Plans suffix sharing for haplotypes in sorted order, given their common-prefix lengths with
-    /// their predecessors; `dup[k]` marks a copy of haplotype `k - 1`, which plays no part.
-    fn new(bases: &[&[u8]], lcp: &[usize], dup: &[bool]) -> Self {
-        let n = bases.len();
-        let distinct: Vec<usize> = (0..n).filter(|&k| !dup[k]).collect();
-        // `lcp` of a first copy is with the previous distinct haplotype or a copy of it, which
-        // has the same bases.
-        let shared_prefix =
-            |t: usize| lcp[distinct[t]].max(distinct.get(t + 1).map_or(0, |&next| lcp[next]));
-        let mut by_suffix = distinct.clone();
-        by_suffix.sort_by(|&a, &b| bases[a].iter().rev().cmp(bases[b].iter().rev()));
-        let lcs: Vec<usize> = (0..by_suffix.len())
-            .map(|r| {
-                if r == 0 { 0 } else { common_suffix(bases[by_suffix[r - 1]], bases[by_suffix[r]]) }
-            })
-            .collect();
-        let mut suffix_pos = vec![0; n];
-        for (r, &k) in by_suffix.iter().enumerate() {
-            suffix_pos[k] = r;
-        }
-        let mut need = vec![0; n];
-        for (t, &k) in distinct.iter().enumerate() {
-            let len = bases[k].len();
-            let r = suffix_pos[k];
-            let shared_suffix = lcs[r].max(lcs.get(r + 1).copied().unwrap_or(0));
-            let p = shared_prefix(t);
-            if p < len {
-                let d = shared_suffix.min(len - p - 1);
-                if d >= MIN_SAVING {
-                    need[k] = d;
-                }
-            }
-        }
-
-        let mut sweeps = Vec::new();
-        let mut sweep_at = vec![None; by_suffix.len()];
-        // How deep the backward pass has computed along the current suffix.
-        let mut reach = 0;
-        for (r, &k) in by_suffix.iter().enumerate() {
-            let resume = lcs[r].min(reach);
-            if need[k] > resume {
-                sweep_at[r] = Some(sweeps.len());
-                sweeps.push(BackwardSweep {
-                    hap: k,
-                    resume,
-                    need: need[k],
-                    start: 0,
-                    writes: Vec::new(),
-                });
-            }
-            reach = resume.max(need[k]);
-        }
-
-        // Depth `depth` of the suffix at position `r` is held by the node of the latest sweep at or
-        // before `r` that computed that depth along a suffix `r` shares at least that deep.
-        let mut node_of: HashMap<(usize, usize), usize> = HashMap::new();
-        let mut node_for = |r: usize, depth: usize| -> usize {
-            if depth == 0 {
-                return 0;
-            }
-            let mut p = r;
-            let mut shared = usize::MAX;
-            loop {
-                if let Some(s) = sweep_at[p] {
-                    let sweep: &BackwardSweep = &sweeps[s];
-                    if sweep.resume < depth && depth <= sweep.need {
-                        let next = node_of.len() + 1;
-                        return *node_of.entry((s, depth)).or_insert(next);
-                    }
-                }
-                shared = shared.min(lcs[p]);
-                assert!(p > 0 && shared >= depth, "backward depth {depth} is never computed");
-                p -= 1;
-            }
-        };
-        let starts: Vec<usize> =
-            sweeps.iter().map(|s| node_for(suffix_pos[s.hap], s.resume)).collect();
-        let mut cuts = vec![None; n];
-        for &k in &distinct {
-            if need[k] > 0 {
-                let node = node_for(suffix_pos[k], need[k]);
-                cuts[k] = Some(Cut { column: bases[k].len() - need[k], node });
-            }
-        }
-        for (sweep, start) in sweeps.iter_mut().zip(starts) {
-            sweep.start = start;
-        }
-        for (&(s, depth), &node) in &node_of {
-            sweeps[s].writes.push((depth, node));
-        }
-        for sweep in &mut sweeps {
-            sweep.writes.sort_unstable();
-        }
-        SuffixPlan { cuts, sweeps, nodes: node_of.len() + 1 }
     }
 }
 
@@ -401,7 +252,7 @@ impl<S: Simd> Runner<S> {
                     ws.snap_cols.push(q);
                 }
             }
-            ws.run_hap(start, stop, hap_len, &haps.codes[k], cut.is_some());
+            ws.run_hap(start, stop, hap_len, &haps.codes[k]);
             let min_accepted = match cut {
                 None => {
                     for (lane, raw) in ws.joined.iter_mut().enumerate().take(reads.len()) {
@@ -743,11 +594,12 @@ impl<S: Simd> Workspace<S> {
 
     /// Runs one haplotype of length `hap_len` over columns `start + 1..=stop`, the state of
     /// column `start` coming from its snapshot. Leaves in `acc` the per-lane raw mass of the paths
-    /// ending at column `stop` or before, and records the snapshots listed in `snap_cols`. With
-    /// `join`, also leaves in `join_m` and `join_y` the forward values of column `stop + 1`
-    /// entered from column `stop`.
+    /// ending at column `stop` or before, and records the snapshots listed in `snap_cols`. When
+    /// it stops before the haplotype's end, which it does only at a cut, also leaves in `join_m`
+    /// and `join_y` the forward values of column `stop + 1` entered from column `stop`.
     #[inline(always)]
-    fn run_hap(&mut self, start: usize, stop: usize, hap_len: usize, codes: &[u8], join: bool) {
+    fn run_hap(&mut self, start: usize, stop: usize, hap_len: usize, codes: &[u8]) {
+        let join = stop < hap_len;
         let lanes = S::LANES;
         let rows = self.rows;
         let num_codes = self.num_codes;
@@ -1253,123 +1105,4 @@ fn backward_row_zero<S: Simd>(
         };
     }
     st
-}
-
-fn common_suffix(a: &[u8], b: &[u8]) -> usize {
-    a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::synthetic::Rng;
-
-    /// Replays the suffix plan of `haps` and checks that every sweep starts from, and every cut
-    /// joins, a node already written for exactly its own suffix at that depth; that no node is
-    /// written twice; and that a cut haplotype's forward sweep still reaches every column the
-    /// next distinct haplotype resumes from.
-    fn consistent_plan<'a>(haps: &[&'a [u8]]) -> SortedHaps<'a> {
-        let sorted = SortedHaps::new(haps, true);
-        let plan = &sorted.plan;
-        let suffix =
-            |k: usize, depth: usize| sorted.bases[k][sorted.bases[k].len() - depth..].to_vec();
-        let mut written: HashMap<usize, Vec<u8>> = HashMap::from([(0, Vec::new())]);
-        for sweep in &plan.sweeps {
-            assert!(sweep.resume < sweep.need);
-            assert_eq!(written.get(&sweep.start), Some(&suffix(sweep.hap, sweep.resume)));
-            for &(depth, node) in &sweep.writes {
-                assert!(sweep.resume < depth && depth <= sweep.need);
-                assert!(written.insert(node, suffix(sweep.hap, depth)).is_none());
-            }
-        }
-        assert_eq!(written.len(), plan.nodes);
-        for (k, cut) in plan.cuts.iter().enumerate() {
-            let Some(cut) = cut else { continue };
-            assert!(!sorted.dup[k]);
-            let depth = sorted.bases[k].len() - cut.column;
-            assert!(depth >= MIN_SAVING);
-            assert_eq!(written.get(&cut.node), Some(&suffix(k, depth)));
-            let next = (k + 1..sorted.len()).find(|&j| !sorted.dup[j]);
-            let resumes_at = next.map_or(0, |j| sorted.lcp[j]);
-            assert!(cut.column > sorted.lcp[k] && cut.column > resumes_at);
-        }
-        sorted
-    }
-
-    fn reference_like(rng: &mut Rng, alphabet: &[u8], len: usize) -> Vec<u8> {
-        (0..len).map(|_| alphabet[rng.below(alphabet.len())]).collect()
-    }
-
-    /// `base` with a few substitutions, insertions or deletions.
-    fn edited(rng: &mut Rng, alphabet: &[u8], base: &[u8]) -> Vec<u8> {
-        let mut hap = base.to_vec();
-        for _ in 0..1 + rng.below(3) {
-            let pos = rng.below(hap.len());
-            match rng.below(3) {
-                0 => hap[pos] = alphabet[rng.below(alphabet.len())],
-                1 => hap.insert(pos, alphabet[rng.below(alphabet.len())]),
-                _ if hap.len() > 1 => {
-                    hap.remove(pos);
-                }
-                _ => {}
-            }
-        }
-        hap
-    }
-
-    #[test]
-    fn a_substitution_cuts_both_haplotypes_right_after_their_shared_prefix() {
-        let reference = reference_like(&mut Rng::new(1), b"ACGT", 40);
-        let mut snp = reference.clone();
-        snp[20] = if snp[20] == b'A' { b'C' } else { b'A' };
-        let sorted = consistent_plan(&[&reference, &snp]);
-        // Both share columns 1..=20 forward and everything after column 21 backward, so both
-        // compute column 21 alone and join the same node there.
-        let cuts = &sorted.plan.cuts;
-        assert_eq!(cuts[0].map(|c| c.column), Some(21));
-        assert_eq!(cuts[0], cuts[1]);
-        assert_eq!(sorted.plan.sweeps.len(), 1);
-    }
-
-    #[test]
-    fn a_haplotype_whose_suffix_is_its_own_runs_forward_to_its_end() {
-        let reference = reference_like(&mut Rng::new(2), b"ACGT", 40);
-        let mut late = reference.clone();
-        late[38] = if late[38] == b'A' { b'C' } else { b'A' };
-        let sorted = consistent_plan(&[&reference, &late]);
-        assert!(sorted.plan.cuts.iter().all(Option::is_none));
-        assert!(sorted.plan.sweeps.is_empty());
-    }
-
-    #[test]
-    fn duplicates_are_never_cut_and_take_their_first_copys_results() {
-        let reference = reference_like(&mut Rng::new(3), b"ACGT", 30);
-        let mut snp = reference.clone();
-        snp[10] = if snp[10] == b'A' { b'C' } else { b'A' };
-        let sorted = consistent_plan(&[&snp, &reference, &snp, &reference]);
-        assert_eq!(sorted.dup, [false, true, false, true]);
-        assert!(sorted.plan.cuts[0].is_some() && sorted.plan.cuts[2].is_some());
-    }
-
-    #[test]
-    fn plans_of_random_haplotype_sets_are_consistent() {
-        let mut rng = Rng::new(4);
-        for case in 0..400 {
-            let alphabet: &[u8] = if case % 2 == 0 { b"AC" } else { b"ACGT" };
-            let len = 5 + rng.below(60);
-            let base = reference_like(&mut rng, alphabet, len);
-            let mut haps = vec![base.clone()];
-            for _ in 0..rng.below(30) {
-                let hap = if rng.chance(0.15) {
-                    haps[rng.below(haps.len())].clone()
-                } else {
-                    let from = rng.below(haps.len());
-                    edited(&mut rng, alphabet, &haps[from])
-                };
-                haps.push(hap);
-            }
-            let refs: Vec<&[u8]> = haps.iter().map(Vec::as_slice).collect();
-            consistent_plan(&refs);
-        }
-    }
 }

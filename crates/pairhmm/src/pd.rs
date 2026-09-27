@@ -151,7 +151,7 @@ mod tests {
     }
 
     fn config(backend: Backend, precision: Precision) -> Config {
-        Config { precision, backend: Some(backend), double_fallback: true, share_suffixes: true }
+        Config { precision, backend: Some(backend), ..Config::default() }
     }
 
     fn region() -> PdRegion {
