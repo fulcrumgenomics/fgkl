@@ -69,7 +69,7 @@ pub trait SimdInt: Copy + Send + Sync + 'static {
     /// `a` where the mask is set, else `b`.
     fn select(mask: Self::Mask, a: Self, b: Self) -> Self;
     /// Stores the low byte of every lane to the `LANES` bytes starting at `dst`. Only called with
-    /// traceback flags, which lie in `0..=127`, so a saturating narrowing is equally correct.
+    /// traceback flags, which lie in `0..=14`, so a saturating narrowing is equally correct.
     ///
     /// # Safety
     /// `dst` must point to at least `LANES` writable bytes.
@@ -292,7 +292,7 @@ pub mod x86 {
         }
         #[inline(always)]
         unsafe fn store_low_bytes_ptr(self, dst: *mut u8) {
-            // Traceback flags lie in 0..=127, so the saturating pack keeps every low byte.
+            // Traceback flags lie in 0..=14, so the saturating pack keeps every low byte.
             unsafe {
                 let packed = _mm_packs_epi16(
                     _mm256_castsi256_si128(self.0),

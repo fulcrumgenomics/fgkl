@@ -43,6 +43,11 @@ pub(crate) trait DiagFill: Send {
 
     /// Traceback flags of cell `(i, j)`, both at least 1.
     fn trace_at(&self, i: usize, j: usize) -> u8;
+
+    /// Overwrites the whole traceback buffer with `byte`, so a test can show a later fill never
+    /// reads what an earlier one left behind.
+    #[cfg(test)]
+    fn poison_trace(&mut self, byte: u8);
 }
 
 /// The relative encoding of one parameter set: the per-step costs and how to decode a stored
@@ -235,7 +240,7 @@ impl<V: SimdInt> DiagWorkspace<V> {
             let i_lo = d.saturating_sub(m).max(1);
             let i_hi = n.min(d - 1);
             let ts = self.diag_start[d];
-            // A vector starting at row i touches rows i - 1 .. i + l of the row buffers, the
+            // A vector starting at row i touches rows i - 1 through i + l - 1 of the row buffers, the
             // alternate from alt_rev index pad + m + i - d, and trace bytes from ts + i - i_lo.
             // Vectors start at rows i_lo..=i_hi, so these bounds cover every access below.
             let row_buffers = [
@@ -252,7 +257,8 @@ impl<V: SimdInt> DiagWorkspace<V> {
                 i_lo >= 1
                     && row_buffers.iter().all(|b| pad + i_hi + l <= b.len())
                     && pad + m + i_hi - d + l <= self.alt_rev.len()
-                    && ts + (i_hi - i_lo) + l <= self.trace.len()
+                    && ts + (i_hi - i_lo) + l <= self.trace.len(),
+                "anti-diagonal {d} of a {n} x {m} fill overruns its buffers"
             );
             let h2 = self.h2.as_ptr();
             let h1 = self.h1.as_ptr();
@@ -383,6 +389,10 @@ macro_rules! diag_fill_impl {
             fn trace_at(&self, i: usize, j: usize) -> u8 {
                 self.trace_at_impl(i, j)
             }
+            #[cfg(test)]
+            fn poison_trace(&mut self, byte: u8) {
+                self.trace.fill(byte);
+            }
         }
     };
     ($ty:ty, $features:literal) => {
@@ -409,6 +419,10 @@ macro_rules! diag_fill_impl {
             }
             fn trace_at(&self, i: usize, j: usize) -> u8 {
                 self.trace_at_impl(i, j)
+            }
+            #[cfg(test)]
+            fn poison_trace(&mut self, byte: u8) {
+                self.trace.fill(byte);
             }
         }
     };

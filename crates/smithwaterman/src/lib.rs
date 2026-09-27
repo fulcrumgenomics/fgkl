@@ -965,6 +965,37 @@ mod tests {
     }
 
     #[test]
+    fn a_fill_writes_every_traceback_cell_it_can_read() {
+        let mut rng = Rng(13);
+        let (big_ref, big_alt) = related_pair(&mut rng, 600, 520);
+        let (r, a) = related_pair(&mut rng, 70, 45);
+        let params = &HAP_TO_REF;
+        let strategy = OverhangStrategy::SoftClip;
+        for backend in Backend::available() {
+            let (narrow, wide) = backend.make_fills();
+            let (fresh_narrow, fresh_wide) = backend.make_fills();
+            for (dirty, fresh) in [(narrow, fresh_narrow), (wide, fresh_wide)] {
+                let (Some(mut dirty), Some(mut fresh)) = (dirty, fresh) else { continue };
+                dirty.fill(&big_ref, &big_alt, params, strategy);
+                dirty.poison_trace(0xFF);
+                assert_eq!(
+                    dirty.fill(&r, &a, params, strategy),
+                    fresh.fill(&r, &a, params, strategy)
+                );
+                for i in 1..=r.len() {
+                    for j in 1..=a.len() {
+                        assert_eq!(
+                            dirty.trace_at(i, j),
+                            fresh.trace_at(i, j),
+                            "{backend} cell ({i}, {j})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_reused_aligner_matches_the_reference_as_pair_sizes_shrink_and_grow() {
         let mut rng = Rng(11);
         // Large unrelated pairs first leave every scratch buffer full of unrelated values.
