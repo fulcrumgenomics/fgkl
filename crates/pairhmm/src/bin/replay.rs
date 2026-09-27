@@ -248,6 +248,11 @@ fn main() {
         Mode { label: "float", precision: Precision::Float, double_fallback: true },
         Mode { label: "double", precision: Precision::Double, double_fallback: true },
     ];
+    if let Some(only) = &only_modes {
+        for label in only {
+            assert!(modes.iter().any(|m| m.label == label), "unknown mode {label}");
+        }
+    }
     for mode in modes {
         if only_modes.as_ref().is_some_and(|m| !m.iter().any(|l| l == mode.label)) {
             continue;

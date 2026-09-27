@@ -346,8 +346,8 @@ const FORWARD_STATES: usize = 3;
 /// Vectors per column of a backward row: match and insertion.
 const BACKWARD_STATES: usize = 2;
 
-/// One DP row: for every column, `STATES` lane vectors back to back (see [`FORWARD_STATES`] and
-/// [`BACKWARD_STATES`]).
+/// One DP row: for every column, [`FORWARD_STATES`] or [`BACKWARD_STATES`] lane vectors back to
+/// back.
 struct RowBuf<E> {
     cells: AlignedVec<E>,
 }
@@ -491,7 +491,12 @@ impl<S: Simd> Workspace<S> {
         self.num_codes = num_codes;
         // Filled row by row, each element written once, so every write lands in the row's block
         // of the tables. Rows past a read's end and lanes without a read hold zeros.
-        let code_bytes: Vec<u8> = (0..num_codes).map(|code| haps.byte_of_code(code)).collect();
+        // Codes are bytes, so there are at most 256 of them.
+        let mut code_bytes = [0u8; 256];
+        for (code, byte) in code_bytes[..num_codes].iter_mut().enumerate() {
+            *byte = haps.byte_of_code(code);
+        }
+        let code_bytes = &code_bytes[..num_codes];
         self.trans.resize_no_fill(rows * NUM_TRANSITIONS * lanes);
         self.prior.resize_no_fill(rows * num_codes * lanes);
         for r in 0..rows {
@@ -802,10 +807,10 @@ impl<S: Simd> Workspace<S> {
         let codes = Codes::new(codes, num_codes);
         let zero = S::zero();
         let scale = S::splat(S::Elem::BACKWARD_SCALE);
-        // Nothing lies below the last row.
         // Swapped as local slices after each row, as in `run_hap`.
         let mut prev: &mut [S::Elem] = &mut bwd_prev.cells;
         let mut cur: &mut [S::Elem] = &mut bwd_cur.cells;
+        // Nothing lies below the last row.
         for j in left..right {
             let col = &mut prev[j * BACKWARD_STATES * lanes..][..BACKWARD_STATES * lanes];
             zero.store(col);
@@ -936,9 +941,8 @@ impl<S: Simd> Transitions<S> {
     }
 }
 
-/// A haplotype's prior-table codes, each checked once to be below `num_codes`, so the sweeps can
-/// index a prior row of `num_codes` entries with one length check per segment rather than a pass
-/// over the codes on every row.
+/// A haplotype's prior-table codes, checked once per sweep to be below `num_codes`, so the sweeps
+/// can index a prior row of `num_codes` entries with one length check per segment.
 #[derive(Clone, Copy)]
 struct Codes<'a> {
     codes: &'a [u8],
