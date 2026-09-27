@@ -53,6 +53,8 @@ cargo ci-fmt && cargo ci-lint && cargo ci-test && cargo ci-doc && cargo ci-deny 
 
 Conventions: `rustfmt.toml` is authoritative for formatting; clippy runs with warnings denied; every public item has a doc comment; comments explain why, not what; tests are named after the behaviour they assert and generate their data in code. Numerics must stay equivalent to GATK's Java implementation (double within 1e-9 in log10 space, single within 1e-4, recomputing below 1e-28 in double as GKL does); `docs/design.md` explains the kernels.
 
+User-facing changes (a new API or option, a behaviour or numerics change, a bug fix a user could hit, a notable performance change) get an entry under `## [Unreleased]` in `CHANGELOG.md` in the same pull request; internal refactors and test- or CI-only changes do not.
+
 Kernel code that touches vector types must be `#[inline(always)]`, because it is only sound when compiled inside the `#[target_feature]` entry points that instantiate it after runtime feature detection.
 
 ## Releasing
@@ -67,6 +69,8 @@ sonatypePassword=<Central Portal user token password>
 Non-snapshot releases are signed with your local `gpg` and its default secret key (set `signing.gnupg.keyName=<key id>` in the same file to pick another), with gpg-agent asking for the passphrase; the key's public half must be on a key server Central can reach. Setting `PGP_SECRET` (ASCII-armoured secret key) and `PGP_PASSPHRASE`, or the `signingKey` and `signingPassword` properties, signs in-process instead. Snapshots are not signed.
 
 `publish.sh` cross-compiles the native library for linux-x86_64, linux-aarch64, osx-x86_64, osx-aarch64 and windows-x86_64, assembles the JAR, runs the Java tests against the Linux libraries in Docker, and publishes to Maven Central. The Windows library is built but not tested by the script; the manually triggered `windows` workflow on GitHub runs the Java tests on a Windows runner when needed.
+
+Before tagging, rename the `Unreleased` section of `CHANGELOG.md` to the new version and date, open a fresh empty `Unreleased` section above it, and update the comparison links at the bottom.
 
 The version lives in `Cargo.toml` and is bumped and tagged by `cargo release`; Gradle reads the same version from the tag, and commits between tags publish as the next patch version with `-SNAPSHOT`.
 
