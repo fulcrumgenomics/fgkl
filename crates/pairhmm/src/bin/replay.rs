@@ -40,7 +40,8 @@ struct SharingEstimate {
     backward: u64,
 }
 
-/// Shortest backward depth worth a cut: the join costs about two columns.
+/// Shortest backward depth worth a cut: the join costs about two columns. Mirrors the kernel's
+/// `MIN_SAVING`; the cut rule below mirrors its `SuffixPlan`.
 const MIN_SAVING: usize = 4;
 
 /// Estimates the columns computed per read base with prefix sharing and with bidirectional

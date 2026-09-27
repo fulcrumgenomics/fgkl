@@ -27,7 +27,7 @@ use crate::{Backend, HapSet, Precision, ReadRef, RunnerKey};
 /// Prior tables always cover these bases; any other byte occurring in a haplotype gets its own.
 const STANDARD_BASES: [u8; 5] = *b"ACGTN";
 
-/// Haplotypes in kernel order plus the bookkeeping for prefix sharing.
+/// Haplotypes in kernel order plus the bookkeeping for sharing prefixes and suffixes.
 pub(crate) struct SortedHaps<'a> {
     /// `order[k]` is the caller's index of the k-th sorted haplotype.
     pub order: Vec<usize>,
@@ -251,10 +251,6 @@ impl SuffixPlan {
         }
         SuffixPlan { cuts, sweeps, nodes: node_of.len() + 1 }
     }
-}
-
-fn common_suffix(a: &[u8], b: &[u8]) -> usize {
-    a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count()
 }
 
 impl HapSet for SortedHaps<'_> {
@@ -1249,6 +1245,10 @@ fn backward_row_zero<S: Simd>(
         };
     }
     st
+}
+
+fn common_suffix(a: &[u8], b: &[u8]) -> usize {
+    a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count()
 }
 
 #[cfg(test)]
