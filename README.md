@@ -34,7 +34,7 @@ HaplotypeCaller on a representative 5.8 Mb shard of a 30x human WGS sample (HG00
 | `--dragen-378-concordance-mode`, same | 104 / 315 | 77 / 105 |
 | `--dragen-378-concordance-mode`, Apple M4 Max (NEON) | n/a (Java fallback: 282 / 296) | 49 / 66 |
 
-Output is byte-identical to GATK's Java implementations in double precision, and to GKL's in DRAGEN 3.7.8 mode; in the default single precision a handful of records per shard differ from GKL in genotype-quality fields only.
+In double precision the output matches GATK's Java implementations call for call, with at most a rare last-digit difference in a genotype likelihood (one record in 680,000 on a chromosome 1 centromere shard; none on a median shard). In DRAGEN 3.7.8 mode it is byte-identical to GKL's. In the default single precision a few hundred records per shard differ from GKL's in genotype-likelihood and genotype-quality fields only.
 
 ## Kernels
 
