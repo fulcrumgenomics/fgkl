@@ -343,23 +343,26 @@ runner_impl!(crate::simd::x86::Avx512F32Narrow, "avx512f");
 #[cfg(target_arch = "x86_64")]
 runner_impl!(crate::simd::x86::Avx512F64Narrow, "avx512f");
 
-/// One DP row of match, insertion and deletion values for every column, lane-interleaved.
+/// Vectors per column of a forward row: match, insertion and deletion, stored in that order so
+/// the inner loop reaches all three from one pointer.
+const FORWARD_STATES: usize = 3;
+/// Vectors per column of a backward row: match and insertion.
+const BACKWARD_STATES: usize = 2;
+
+/// One DP row: for every column, `STATES` lane vectors back to back (see [`FORWARD_STATES`] and
+/// [`BACKWARD_STATES`]).
 struct RowBuf<E> {
-    m: AlignedVec<E>,
-    x: AlignedVec<E>,
-    y: AlignedVec<E>,
+    cells: AlignedVec<E>,
 }
 
 impl<E: Float> RowBuf<E> {
     fn new() -> Self {
-        RowBuf { m: AlignedVec::new(), x: AlignedVec::new(), y: AlignedVec::new() }
+        RowBuf { cells: AlignedVec::new() }
     }
 
-    /// Sizes the row without clearing it: `run_hap` initialises every column it reads.
+    /// Sizes the row without clearing it: the sweeps initialise every column they read.
     fn resize(&mut self, len: usize) {
-        self.m.resize_no_fill(len);
-        self.x.resize_no_fill(len);
-        self.y.resize_no_fill(len);
+        self.cells.resize_no_fill(len);
     }
 }
 
@@ -392,25 +395,6 @@ impl<E: Float> Snapshot<E> {
         self.x.resize_no_fill(cells);
         self.y.resize_no_fill(cells);
         self.acc.resize_no_fill(lanes);
-    }
-}
-
-/// One row of backward match and insertion values for every column, lane-interleaved. Backward
-/// deletion values only travel along a row, so they live in registers.
-struct BackwardRow<E> {
-    m: AlignedVec<E>,
-    x: AlignedVec<E>,
-}
-
-impl<E: Float> BackwardRow<E> {
-    fn new() -> Self {
-        BackwardRow { m: AlignedVec::new(), x: AlignedVec::new() }
-    }
-
-    /// Sizes the row without clearing it: a backward sweep zeroes the columns it reads first.
-    fn resize(&mut self, len: usize) {
-        self.m.resize_no_fill(len);
-        self.x.resize_no_fill(len);
     }
 }
 
@@ -462,8 +446,10 @@ struct Workspace<S: Simd> {
     lcp_counts: Vec<u32>,
     /// Columns of the current haplotype whose state must be snapshotted.
     snap_cols: Vec<usize>,
-    bwd_prev: BackwardRow<S::Elem>,
-    bwd_cur: BackwardRow<S::Elem>,
+    /// Backward rows hold match and insertion values; backward deletion values only travel
+    /// along a row, so they live in registers.
+    bwd_prev: RowBuf<S::Elem>,
+    bwd_cur: RowBuf<S::Elem>,
     /// Indexed by the node numbers of the haplotype set's [`SuffixPlan`].
     bwd_nodes: Vec<BackwardNode<S::Elem>>,
     /// `[row][lane]`: the forward match and deletion values of a cut column, entered from the
@@ -489,8 +475,8 @@ impl<S: Simd> Workspace<S> {
             snapshots: Vec::new(),
             lcp_counts: Vec::new(),
             snap_cols: Vec::new(),
-            bwd_prev: BackwardRow::new(),
-            bwd_cur: BackwardRow::new(),
+            bwd_prev: RowBuf::new(),
+            bwd_cur: RowBuf::new(),
             bwd_nodes: Vec::new(),
             join_m: AlignedVec::new(),
             join_y: AlignedVec::new(),
@@ -547,8 +533,8 @@ impl<S: Simd> Workspace<S> {
             self.end_rows[read.len() - 1] = true;
         }
         let cols = haps.max_len + 1;
-        self.row_prev.resize(cols * lanes);
-        self.row_cur.resize(cols * lanes);
+        self.row_prev.resize(cols * FORWARD_STATES * lanes);
+        self.row_cur.resize(cols * FORWARD_STATES * lanes);
         self.acc.resize(lanes, S::Elem::ZERO);
         if self.snapshots.len() < cols {
             self.snapshots.resize_with(cols, Snapshot::new);
@@ -573,8 +559,8 @@ impl<S: Simd> Workspace<S> {
             }
         }
         if !haps.plan.sweeps.is_empty() {
-            self.bwd_prev.resize(cols * lanes);
-            self.bwd_cur.resize(cols * lanes);
+            self.bwd_prev.resize(cols * BACKWARD_STATES * lanes);
+            self.bwd_cur.resize(cols * BACKWARD_STATES * lanes);
             let nodes = haps.plan.nodes;
             if self.bwd_nodes.len() < nodes {
                 self.bwd_nodes.resize_with(nodes, BackwardNode::new);
@@ -652,10 +638,12 @@ impl<S: Simd> Workspace<S> {
         let init = S::splat(S::Elem::from_f64(S::Elem::INITIAL_CONSTANT.to_f64() / hap_len as f64));
         let scale = S::splat(S::Elem::from_f64(src.hap_len as f64 / hap_len as f64));
 
+        let stride = FORWARD_STATES * lanes;
         for j in start..=stop {
-            zero.store(&mut row_prev.m[j * lanes..]);
-            zero.store(&mut row_prev.x[j * lanes..]);
-            init.store(&mut row_prev.y[j * lanes..]);
+            let col = &mut row_prev.cells[j * stride..][..stride];
+            zero.store(col);
+            zero.store(&mut col[lanes..]);
+            init.store(&mut col[2 * lanes..]);
         }
         let mut acc_v = S::load(src_acc).mul(scale);
         for &q in snap_cols.iter() {
@@ -683,8 +671,8 @@ impl<S: Simd> Workspace<S> {
                 x_left: S::load(&src_x[i * lanes..]).mul(scale),
                 y_left: S::load(&src_y[i * lanes..]).mul(scale),
             };
-            let prev = RowView { m: &row_prev.m, x: &row_prev.x, y: &row_prev.y };
-            let mut cur = RowViewMut { m: &mut row_cur.m, x: &mut row_cur.x, y: &mut row_cur.y };
+            let prev: &[S::Elem] = &row_prev.cells;
+            let cur: &mut [S::Elem] = &mut row_cur.cells;
             let mut rowsum = zero;
             if end_rows[r] {
                 // A read ends on this row, so every snapshot also needs the row's sum up to its
@@ -699,8 +687,8 @@ impl<S: Simd> Workspace<S> {
                             codes,
                             lo,
                             q,
-                            &prev,
-                            &mut cur,
+                            prev,
+                            cur,
                             state,
                             &mut rowsum,
                         );
@@ -719,8 +707,8 @@ impl<S: Simd> Workspace<S> {
                         codes,
                         lo,
                         stop,
-                        &prev,
-                        &mut cur,
+                        prev,
+                        cur,
                         state,
                         &mut rowsum,
                     );
@@ -735,18 +723,18 @@ impl<S: Simd> Workspace<S> {
                         codes,
                         start,
                         stop,
-                        &prev,
-                        &mut cur,
+                        prev,
+                        cur,
                         state,
                         &mut rowsum,
                     );
                 }
                 for &q in snap_cols.iter() {
                     let snap = &mut after[q - start - 1];
-                    let col = q * lanes..(q + 1) * lanes;
-                    snap.m[i * lanes..][..lanes].copy_from_slice(&cur.m[col.clone()]);
-                    snap.x[i * lanes..][..lanes].copy_from_slice(&cur.x[col.clone()]);
-                    snap.y[i * lanes..][..lanes].copy_from_slice(&cur.y[col]);
+                    let col = &cur[q * stride..][..stride];
+                    snap.m[i * lanes..][..lanes].copy_from_slice(&col[..lanes]);
+                    snap.x[i * lanes..][..lanes].copy_from_slice(&col[lanes..2 * lanes]);
+                    snap.y[i * lanes..][..lanes].copy_from_slice(&col[2 * lanes..]);
                 }
             }
             if join {
@@ -817,8 +805,9 @@ impl<S: Simd> Workspace<S> {
         let scale = S::splat(S::Elem::BACKWARD_SCALE);
         // Nothing lies below the last row.
         for j in left..right {
-            zero.store(&mut bwd_prev.m[j * lanes..]);
-            zero.store(&mut bwd_prev.x[j * lanes..]);
+            let col = &mut bwd_prev.cells[j * BACKWARD_STATES * lanes..][..BACKWARD_STATES * lanes];
+            zero.store(col);
+            zero.store(&mut col[lanes..]);
         }
         let mut starts_after = S::load(&start.s);
         for i in (0..=rows).rev() {
@@ -847,8 +836,8 @@ impl<S: Simd> Workspace<S> {
                 by_right: S::load(&start.y[i * lanes..]),
                 bm_last: zero,
             };
-            let prev = BackwardRowView { m: &bwd_prev.m, x: &bwd_prev.x };
-            let mut cur = BackwardRowViewMut { m: &mut bwd_cur.m, x: &mut bwd_cur.x };
+            let prev: &[S::Elem] = &bwd_prev.cells;
+            let cur: &mut [S::Elem] = &mut bwd_cur.cells;
             let mut hi = right;
             for w in 0..=sweep.writes.len() {
                 let (lo, node) = match sweep.writes.get(w) {
@@ -863,17 +852,17 @@ impl<S: Simd> Workspace<S> {
                             codes,
                             lo,
                             hi,
-                            &prev,
+                            prev,
                             state,
                             &mut starts_after,
                         )
                     } else if let Some(sink) = sink {
                         backward_segment::<S, true>(
-                            &below, md, dd, prior_row, codes, lo, hi, &prev, &mut cur, state, sink,
+                            &below, md, dd, prior_row, codes, lo, hi, prev, cur, state, sink,
                         )
                     } else {
                         backward_segment::<S, false>(
-                            &below, md, dd, prior_row, codes, lo, hi, &prev, &mut cur, state, zero,
+                            &below, md, dd, prior_row, codes, lo, hi, prev, cur, state, zero,
                         )
                     };
                     hi = lo;
@@ -894,19 +883,6 @@ impl<S: Simd> Workspace<S> {
         }
         self.bwd_nodes[sweep.start] = start;
     }
-}
-
-/// Plain-slice views of a [`RowBuf`], resolved once per row so the hot loop indexes slices directly.
-struct RowView<'a, E> {
-    m: &'a [E],
-    x: &'a [E],
-    y: &'a [E],
-}
-
-struct RowViewMut<'a, E> {
-    m: &'a mut [E],
-    x: &'a mut [E],
-    y: &'a mut [E],
 }
 
 /// Converts a lane's raw scaled probability for sorted haplotype `k`, computed in precision `E`,
@@ -998,35 +974,34 @@ fn dp_segment<S: Simd, const ACC: bool>(
     codes: Codes<'_>,
     lo: usize,
     hi: usize,
-    prev: &RowView<'_, S::Elem>,
-    cur: &mut RowViewMut<'_, S::Elem>,
+    prev: &[S::Elem],
+    cur: &mut [S::Elem],
     mut st: CellState<S>,
     rowsum: &mut S,
 ) -> CellState<S> {
     // Bounds are checked once per segment rather than on each of the seven loads and stores per
     // cell, which otherwise cost about a quarter of the inner loop. Column `j` occupies elements
-    // `j * lanes..(j + 1) * lanes` of a row, and code `c` occupies `c * lanes..(c + 1) * lanes`
-    // of the prior row.
+    // `j * stride..(j + 1) * stride` of a row, match then insertion then deletion, and code `c`
+    // occupies `c * lanes..(c + 1) * lanes` of the prior row.
     let lanes = S::LANES;
-    let end = (hi + 1) * lanes;
-    assert!(prev.m.len() >= end && prev.x.len() >= end && prev.y.len() >= end);
-    assert!(cur.m.len() >= end && cur.x.len() >= end && cur.y.len() >= end);
+    let stride = FORWARD_STATES * lanes;
+    let end = (hi + 1) * stride;
+    assert!(prev.len() >= end && cur.len() >= end);
     assert!(prior_row.len() >= codes.num_codes * lanes);
     let codes = &codes.codes[lo..hi];
-    let (prev_m, prev_x, prev_y) = (prev.m.as_ptr(), prev.x.as_ptr(), prev.y.as_ptr());
-    let (cur_m, cur_x, cur_y) = (cur.m.as_mut_ptr(), cur.x.as_mut_ptr(), cur.y.as_mut_ptr());
+    let (prev, cur) = (prev.as_ptr(), cur.as_mut_ptr());
     let priors = prior_row.as_ptr();
     for (k, &code) in codes.iter().enumerate() {
-        let off = (lo + 1 + k) * lanes;
-        // SAFETY: `off + lanes <= end` by the checks above, `(code + 1) * lanes <= prior_row.len()`
-        // since `Codes` holds only codes below `num_codes`, and the previous and current rows are
-        // distinct buffers.
+        let off = (lo + 1 + k) * stride;
+        // SAFETY: `off + stride <= end` by the checks above, `(code + 1) * lanes <=
+        // prior_row.len()` since `Codes` holds only codes below `num_codes`, and the previous and
+        // current rows are distinct buffers.
         let (prior, m_up, x_up, y_up) = unsafe {
             (
                 S::load_ptr(priors.add(code as usize * lanes)),
-                S::load_ptr(prev_m.add(off)),
-                S::load_ptr(prev_x.add(off)),
-                S::load_ptr(prev_y.add(off)),
+                S::load_ptr(prev.add(off)),
+                S::load_ptr(prev.add(off + lanes)),
+                S::load_ptr(prev.add(off + 2 * lanes)),
             )
         };
         let m = prior.mul(st.y_diag.mul_add(t.im, st.x_diag.mul_add(t.im, st.m_diag.mul(t.mm))));
@@ -1034,9 +1009,9 @@ fn dp_segment<S: Simd, const ACC: bool>(
         let y = st.y_left.mul_add(t.dd, st.m_left.mul(t.md));
         // SAFETY: as above, for the current row.
         unsafe {
-            m.store_ptr(cur_m.add(off));
-            x.store_ptr(cur_x.add(off));
-            y.store_ptr(cur_y.add(off));
+            m.store_ptr(cur.add(off));
+            x.store_ptr(cur.add(off + lanes));
+            y.store_ptr(cur.add(off + 2 * lanes));
         }
         if ACC {
             *rowsum = rowsum.add(m.add(x));
@@ -1045,17 +1020,6 @@ fn dp_segment<S: Simd, const ACC: bool>(
             CellState { m_diag: m_up, x_diag: x_up, y_diag: y_up, m_left: m, x_left: x, y_left: y };
     }
     st
-}
-
-/// Views of a [`BackwardRow`], resolved once per row.
-struct BackwardRowView<'a, E> {
-    m: &'a [E],
-    x: &'a [E],
-}
-
-struct BackwardRowViewMut<'a, E> {
-    m: &'a mut [E],
-    x: &'a mut [E],
 }
 
 /// What a backward row sweep carries from one cell to the next cell on its left.
@@ -1083,31 +1047,30 @@ fn backward_segment<S: Simd, const SINK: bool>(
     codes: Codes<'_>,
     lo: usize,
     hi: usize,
-    prev: &BackwardRowView<'_, S::Elem>,
-    cur: &mut BackwardRowViewMut<'_, S::Elem>,
+    prev: &[S::Elem],
+    cur: &mut [S::Elem],
     mut st: BackwardState<S>,
     sink: S,
 ) -> BackwardState<S> {
     // Bounds are checked once per segment, as in `dp_segment`. Column `j` occupies elements
-    // `j * lanes..(j + 1) * lanes` of a row.
+    // `j * stride..(j + 1) * stride` of a row, match then insertion.
     let lanes = S::LANES;
-    let end = hi * lanes;
-    assert!(prev.m.len() >= end && prev.x.len() >= end);
-    assert!(cur.m.len() >= end && cur.x.len() >= end);
+    let stride = BACKWARD_STATES * lanes;
+    let end = hi * stride;
+    assert!(prev.len() >= end && cur.len() >= end);
     // Moving from column j to j + 1 emits haplotype base j + 1, whose code is `codes[j]`.
     assert!(prior_row.len() >= codes.num_codes * lanes);
     let codes = &codes.codes[lo..hi];
-    let (prev_m, prev_x) = (prev.m.as_ptr(), prev.x.as_ptr());
-    let (cur_m, cur_x) = (cur.m.as_mut_ptr(), cur.x.as_mut_ptr());
+    let (prev, cur) = (prev.as_ptr(), cur.as_mut_ptr());
     let priors = prior_row.as_ptr();
     for (k, &code) in codes.iter().enumerate().rev() {
-        let off = (lo + k) * lanes;
+        let off = (lo + k) * stride;
         // SAFETY: as in `dp_segment`.
         let (prior, bx_below, bm_below) = unsafe {
             (
                 S::load_ptr(priors.add(code as usize * lanes)),
-                S::load_ptr(prev_x.add(off)),
-                S::load_ptr(prev_m.add(off)),
+                S::load_ptr(prev.add(off + lanes)),
+                S::load_ptr(prev.add(off)),
             )
         };
         let into_match = prior.mul(st.bm_diag);
@@ -1121,8 +1084,8 @@ fn backward_segment<S: Simd, const SINK: bool>(
         }
         // SAFETY: as above, for the current row.
         unsafe {
-            bm.store_ptr(cur_m.add(off));
-            bx.store_ptr(cur_x.add(off));
+            bm.store_ptr(cur.add(off));
+            bx.store_ptr(cur.add(off + lanes));
         }
         st = BackwardState { bm_diag: bm_below, by_right: by, bm_last: bm };
     }
@@ -1140,7 +1103,7 @@ fn backward_row_zero<S: Simd>(
     codes: Codes<'_>,
     lo: usize,
     hi: usize,
-    prev: &BackwardRowView<'_, S::Elem>,
+    prev: &[S::Elem],
     mut st: BackwardState<S>,
     starts_after: &mut S,
 ) -> BackwardState<S> {
@@ -1150,7 +1113,7 @@ fn backward_row_zero<S: Simd>(
         let by = prior.mul(st.bm_diag).mul(im);
         *starts_after = starts_after.add(by);
         st = BackwardState {
-            bm_diag: S::load(&prev.m[j * lanes..]),
+            bm_diag: S::load(&prev[j * BACKWARD_STATES * lanes..]),
             by_right: by,
             bm_last: st.bm_last,
         };
