@@ -12,11 +12,13 @@ mod model;
 mod pd;
 mod pd_kernel;
 pub mod pd_reference;
+mod plan;
 pub mod reference;
 mod simd;
 pub mod synthetic;
 
 pub use pd::{ALT_A, ALT_C, ALT_G, ALT_T, DEL_END, DEL_START, PdHaplotype, PdPairHmm, SNP};
+pub use plan::SharedColumns;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -212,14 +214,24 @@ pub struct Config {
     /// `None` selects the fastest available backend.
     pub backend: Option<Backend>,
     /// Recompute in double precision every pair whose single-precision result underflowed
-    /// (GKL's policy). Disable only to measure what that recomputation costs: the affected
-    /// results are then `NaN`.
+    /// (GKL's policy), and without suffix sharing every pair whose joined result was too small
+    /// for the backward values. Disable only to measure what that recomputation costs: the
+    /// affected results are then `NaN`.
     pub double_fallback: bool,
+    /// Share work between haplotypes with a common suffix as well as a common prefix. Results stay
+    /// within tolerance of the prefix-only kernel but differ from it in the last bits wherever a
+    /// haplotype joins backward values; disable to reproduce those bits. Ignored by [`PdPairHmm`].
+    pub share_suffixes: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { precision: Precision::Float, backend: None, double_fallback: true }
+        Config {
+            precision: Precision::Float,
+            backend: None,
+            double_fallback: true,
+            share_suffixes: true,
+        }
     }
 }
 
@@ -227,12 +239,13 @@ impl Default for Config {
 /// computes on the calling thread.
 pub struct PairHmm {
     inner: Batcher,
+    share_suffixes: bool,
 }
 
 impl PairHmm {
     /// Builds a PairHMM for `config`, failing if the requested backend is unavailable on this CPU.
     pub fn new(config: &Config) -> Result<Self, Error> {
-        Ok(PairHmm { inner: Batcher::new(config)? })
+        Ok(PairHmm { inner: Batcher::new(config)?, share_suffixes: config.share_suffixes })
     }
 
     /// The vector instruction set in use.
@@ -245,8 +258,9 @@ impl PairHmm {
         self.inner.precision
     }
 
-    /// How many pairs so far underflowed in single precision and were (or, with
-    /// `double_fallback` off, would have been) recomputed in double precision.
+    /// How many pairs so far lost precision and were (or, with `double_fallback` off, would have
+    /// been) recomputed: pairs that underflowed in single precision, and pairs whose result
+    /// joined from backward values was too small for them.
     pub fn fallback_pairs(&self) -> u64 {
         self.inner.fallback_pairs()
     }
@@ -272,9 +286,16 @@ impl PairHmm {
         if expected == 0 {
             return Ok(());
         }
-        self.inner.compute(reads, &SortedHaps::new(haplotypes), out);
+        self.inner.compute(reads, &SortedHaps::new(haplotypes, self.share_suffixes), out);
         Ok(())
     }
+}
+
+/// The haplotype columns per read base the PairHMM computes for `haplotypes`, with prefix sharing
+/// alone and with suffix sharing too: a diagnostic of how much work sharing saves.
+pub fn shared_columns(haplotypes: &[&[u8]]) -> SharedColumns {
+    let sorted = SortedHaps::new(haplotypes, true);
+    sorted.plan.columns(&sorted.bases, &sorted.lcp, &sorted.dup)
 }
 
 /// Why a likelihood computation was refused; indices are into the caller's arrays.
@@ -363,7 +384,7 @@ impl Batcher {
         if !fallback.is_empty() {
             self.fallback_pairs.fetch_add(fallback.len() as u64, Ordering::Relaxed);
             if self.double_fallback {
-                self.run_fallback(&fallback, &sorted_reads, haps, &mut tmp);
+                self.run_fallback(self.precision, &fallback, &sorted_reads, haps, &mut tmp);
             }
         }
         for (pos, &read) in read_order.iter().enumerate() {
@@ -425,18 +446,46 @@ impl Batcher {
         }
     }
 
-    /// Recomputes the given `(read, sorted haplotype)` pairs in double precision. A read that
-    /// underflowed against a third or more of the haplotypes is run against all of them in one
-    /// prefix-shared sweep, which is cheaper than an unshared sweep per haplotype; the other
-    /// pairs are grouped by haplotype and run one haplotype at a time.
+    /// Recomputes the `(read, sorted haplotype)` pairs a pass in precision `first` lost. After
+    /// a single-precision pass they are recomputed in double precision; any whose joined double
+    /// result is still too small for the backward values, and any lost by a double-precision
+    /// pass in the first place, are recomputed once more without suffix sharing, which cannot
+    /// lose a pair.
     fn run_fallback<H: HapSet>(
         &self,
+        first: Precision,
         pairs: &[(usize, usize)],
         reads: &[ReadRef<'_>],
         haps: &H,
         tmp: &mut [f64],
     ) {
+        let lost = match first {
+            Precision::Float => self.recompute_in_double(pairs, reads, haps, tmp),
+            Precision::Double => pairs.to_vec(),
+        };
+        if !lost.is_empty() {
+            let unshared = haps.without_suffix_sharing();
+            let none = self.recompute_in_double(&lost, reads, &unshared, tmp);
+            debug_assert!(
+                none.is_empty(),
+                "double precision without suffix sharing never falls back"
+            );
+        }
+    }
+
+    /// Recomputes the given pairs in double precision, returning those whose joined result lies
+    /// below `Float::MIN_ACCEPTED_JOINED`. A read lost against a third or more of the haplotypes is
+    /// run against all of them in one shared sweep, which is cheaper than an unshared sweep per
+    /// haplotype; the other pairs are grouped by haplotype and run one haplotype at a time.
+    fn recompute_in_double<H: HapSet>(
+        &self,
+        pairs: &[(usize, usize)],
+        reads: &[ReadRef<'_>],
+        haps: &H,
+        tmp: &mut [f64],
+    ) -> Vec<(usize, usize)> {
         let n_haps = haps.len();
+        let mut lost = Vec::new();
         let mut per_read: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for &(r, h) in pairs {
             per_read.entry(r).or_default().push(h);
@@ -446,8 +495,8 @@ impl Batcher {
         if !dense.is_empty() {
             let batch: Vec<ReadRef<'_>> = dense.iter().map(|&r| reads[r]).collect();
             let mut out = vec![0.0f64; batch.len() * n_haps];
-            let none = self.run_pass(Precision::Double, &batch, haps, &mut out);
-            debug_assert!(none.is_empty(), "double precision never falls back");
+            let dense_lost = self.run_pass(Precision::Double, &batch, haps, &mut out);
+            lost.extend(dense_lost.into_iter().map(|(i, h)| (dense[i], h)));
             for (i, &r) in dense.iter().enumerate() {
                 for &h in &per_read[&r] {
                     tmp[r * n_haps + h] = out[i * n_haps + h];
@@ -477,7 +526,8 @@ impl Batcher {
                 }
             }
         }
-        debug_assert!(none.is_empty(), "double precision never falls back");
+        debug_assert!(none.is_empty(), "a single haplotype joins nothing, so it cannot be lost");
+        lost
     }
 }
 
@@ -488,6 +538,9 @@ pub(crate) trait HapSet: Sized {
     fn order(&self) -> &[usize];
     /// The set holding only sorted haplotype `k`, for per-haplotype double recomputation.
     fn single(&self, k: usize) -> Self;
+    /// The same set, in the same sorted order, with no haplotype joining backward values: the
+    /// last resort for pairs whose joined result lies below `Float::MIN_ACCEPTED_JOINED`.
+    fn without_suffix_sharing(&self) -> Self;
     /// Lane count of the kernel instantiation `key` selects.
     fn lanes(key: RunnerKey) -> usize;
     /// Runs at most `lanes(key)` reads against every haplotype on this thread's cached runner;
@@ -555,7 +608,7 @@ mod tests {
             let config = Config {
                 precision: Precision::Double,
                 backend: Some(backend),
-                double_fallback: true,
+                ..Config::default()
             };
             assert_close(&compute(&config, &reads, &haps), &expected, 1e-9, backend.name());
         }
@@ -567,11 +620,8 @@ mod tests {
         let (reads, haps) = (region.read_refs(), region.haplotype_refs());
         let expected = reference_all(&reads, &haps);
         for backend in Backend::available() {
-            let config = Config {
-                precision: Precision::Float,
-                backend: Some(backend),
-                double_fallback: true,
-            };
+            let config =
+                Config { precision: Precision::Float, backend: Some(backend), ..Config::default() };
             assert_close(&compute(&config, &reads, &haps), &expected, 1e-4, backend.name());
         }
     }
@@ -606,7 +656,7 @@ mod tests {
             let config = Config {
                 precision: Precision::Double,
                 backend: Some(backend),
-                double_fallback: true,
+                ..Config::default()
             };
             assert_close(&compute(&config, &reads, &haps), &expected, 1e-9, backend.name());
         }
@@ -638,7 +688,7 @@ mod tests {
             let config = Config {
                 precision: Precision::Double,
                 backend: Some(backend),
-                double_fallback: true,
+                ..Config::default()
             };
             assert_close(&compute(&config, &reads, &haps), &expected, 1e-9, backend.name());
         }
@@ -664,12 +714,173 @@ mod tests {
         // scaled by 2^120, so the single-precision pass must hand this pair to the f64 kernel.
         assert!(expected[0].is_finite() && expected[0] < -50.0);
         for backend in Backend::available() {
-            let config = Config {
-                precision: Precision::Float,
-                backend: Some(backend),
-                double_fallback: true,
-            };
+            let config =
+                Config { precision: Precision::Float, backend: Some(backend), ..Config::default() };
             assert_close(&compute(&config, &reads, &haps), &expected, 1e-9, backend.name());
+        }
+    }
+
+    fn config(precision: Precision, backend: Backend, share_suffixes: bool) -> Config {
+        Config { precision, backend: Some(backend), double_fallback: true, share_suffixes }
+    }
+
+    /// A region whose haplotypes share long prefixes and suffixes, with reads of many lengths so
+    /// the lanes of a batch end on different rows.
+    fn suffix_sharing_region() -> Region {
+        Region::generate(21, 90, 150, 40, 260)
+    }
+
+    #[test]
+    fn suffix_sharing_matches_reference_in_double_on_every_backend() {
+        let region = suffix_sharing_region();
+        let (reads, haps) = (region.read_refs(), region.haplotype_refs());
+        assert!(SortedHaps::new(&haps, true).plan.cuts.iter().filter(|c| c.is_some()).count() > 20);
+        let expected = reference_all(&reads, &haps);
+        for backend in Backend::available() {
+            let actual = compute(&config(Precision::Double, backend, true), &reads, &haps);
+            assert_close(&actual, &expected, 1e-9, backend.name());
+        }
+    }
+
+    #[test]
+    fn suffix_sharing_matches_reference_in_float_within_tolerance() {
+        let region = suffix_sharing_region();
+        let (reads, haps) = (region.read_refs(), region.haplotype_refs());
+        let expected = reference_all(&reads, &haps);
+        for backend in Backend::available() {
+            let actual = compute(&config(Precision::Float, backend, true), &reads, &haps);
+            assert_close(&actual, &expected, 1e-4, backend.name());
+        }
+    }
+
+    #[test]
+    fn random_small_haplotype_sets_match_reference_with_suffix_sharing() {
+        // Two-letter haplotypes derived from one another give deep, nested and overlapping
+        // shared prefixes and suffixes, and duplicates.
+        let mut rng = synthetic::Rng::new(31);
+        let letter = |rng: &mut synthetic::Rng| if rng.chance(0.5) { b'A' } else { b'C' };
+        for _ in 0..60 {
+            let mut haps: Vec<Vec<u8>> =
+                vec![(0..6 + rng.below(30)).map(|_| letter(&mut rng)).collect()];
+            for _ in 0..rng.below(12) {
+                let from = rng.below(haps.len());
+                let hap = synthetic::edited(&mut rng, b"AC", &haps[from]);
+                haps.push(hap);
+            }
+            let reads: Vec<synthetic::Read> = (0..1 + rng.below(20))
+                .map(|_| {
+                    let len = 1 + rng.below(25);
+                    synthetic::Read {
+                        bases: (0..len).map(|_| letter(&mut rng)).collect(),
+                        quals: (0..len).map(|_| 10 + rng.below(31) as u8).collect(),
+                        ins_gop: (0..len).map(|_| 20 + rng.below(26) as u8).collect(),
+                        del_gop: (0..len).map(|_| 20 + rng.below(26) as u8).collect(),
+                        gcp: (0..len).map(|_| 1 + rng.below(10) as u8).collect(),
+                    }
+                })
+                .collect();
+            let reads: Vec<ReadRef<'_>> = reads.iter().map(synthetic::Read::as_ref).collect();
+            let haps: Vec<&[u8]> = haps.iter().map(Vec::as_slice).collect();
+            let expected = reference_all(&reads, &haps);
+            for backend in Backend::available() {
+                let actual = compute(&config(Precision::Double, backend, true), &reads, &haps);
+                assert_close(&actual, &expected, 1e-9, backend.name());
+            }
+        }
+    }
+
+    #[test]
+    fn haplotypes_without_a_cut_keep_their_prefix_only_bits() {
+        let region = Region::generate(23, 20, 90, 24, 160);
+        let (reads, haps) = (region.read_refs(), region.haplotype_refs());
+        let sorted = SortedHaps::new(&haps, true);
+        let uncut: Vec<usize> = (0..haps.len())
+            .filter(|&k| sorted.plan.cuts[k].is_none() && !sorted.dup[k])
+            .map(|k| sorted.order[k])
+            .collect();
+        assert!(!uncut.is_empty());
+        for backend in Backend::available() {
+            for precision in [Precision::Float, Precision::Double] {
+                let shared = compute(&config(precision, backend, true), &reads, &haps);
+                let prefix_only = compute(&config(precision, backend, false), &reads, &haps);
+                for r in 0..reads.len() {
+                    for &h in &uncut {
+                        let i = r * haps.len() + h;
+                        assert_eq!(
+                            shared[i].to_bits(),
+                            prefix_only[i].to_bits(),
+                            "{backend} {precision}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deep_pairs_fall_back_to_double_with_suffix_sharing() {
+        // Haplotypes of As sharing prefixes and suffixes, against reads of Cs: every pair lies far
+        // below single precision's range, whether its haplotype joins backward values or not.
+        let base = vec![b'A'; 90];
+        let mut haps: Vec<Vec<u8>> = vec![base.clone()];
+        for pos in [20, 45, 70] {
+            let mut hap = base.clone();
+            hap[pos] = b'G';
+            haps.push(hap);
+        }
+        let haps: Vec<&[u8]> = haps.iter().map(Vec::as_slice).collect();
+        assert!(SortedHaps::new(&haps, true).plan.cuts.iter().any(Option::is_some));
+        let read = synthetic::Read {
+            bases: vec![b'C'; 70],
+            quals: vec![40; 70],
+            ins_gop: vec![45; 70],
+            del_gop: vec![45; 70],
+            gcp: vec![10; 70],
+        };
+        let reads = vec![read.as_ref()];
+        let expected = reference_all(&reads, &haps);
+        assert!(expected.iter().all(|&e| e < -50.0));
+        for backend in Backend::available() {
+            let hmm = PairHmm::new(&config(Precision::Float, backend, true)).unwrap();
+            let mut out = vec![0.0; haps.len()];
+            hmm.compute_log10_likelihoods(&reads, &haps, &mut out).unwrap();
+            assert_eq!(hmm.fallback_pairs(), haps.len() as u64, "{backend}");
+            assert_close(&out, &expected, 1e-9, backend.name());
+        }
+    }
+
+    #[test]
+    fn likelihoods_below_the_backward_range_are_recomputed_without_suffix_sharing() {
+        // Long reads unrelated to haplotypes that share suffixes: likelihoods far below 1e-308,
+        // where double-precision backward values flush, so the joined results must be replaced.
+        let mut rng = synthetic::Rng::new(99);
+        let reference: Vec<u8> = (0..700).map(|_| rng.base()).collect();
+        let mut haps = vec![reference.clone()];
+        for pos in [20, 40, 60] {
+            let mut hap = reference.clone();
+            hap[pos] = if hap[pos] == b'A' { b'C' } else { b'A' };
+            haps.push(hap);
+        }
+        let haps: Vec<&[u8]> = haps.iter().map(Vec::as_slice).collect();
+        assert!(SortedHaps::new(&haps, true).plan.cuts.iter().any(Option::is_some));
+        let reads: Vec<synthetic::Read> = [290, 360, 500]
+            .iter()
+            .map(|&len| synthetic::Read {
+                bases: (0..len).map(|_| rng.base()).collect(),
+                quals: vec![40; len],
+                ins_gop: vec![45; len],
+                del_gop: vec![45; len],
+                gcp: vec![10; len],
+            })
+            .collect();
+        let reads: Vec<ReadRef<'_>> = reads.iter().map(synthetic::Read::as_ref).collect();
+        let expected = reference_all(&reads, &haps);
+        assert!(expected.iter().any(|&e| e < -400.0));
+        for backend in Backend::available() {
+            for precision in [Precision::Double, Precision::Float] {
+                let actual = compute(&config(precision, backend, true), &reads, &haps);
+                assert_close(&actual, &expected, 1e-9, &format!("{backend} {precision}"));
+            }
         }
     }
 

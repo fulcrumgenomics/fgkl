@@ -4,7 +4,9 @@
 //! much work prefix sharing removes.
 //!
 //! Usage: pairhmm-replay <pairs.txt> [--backend NAME] [--iters N] [--max-regions N]
-//!        [--only-region N] [--dump-region N FILE] [--write-results DIR]
+//!        [--only-region N] [--dump-region N FILE] [--write-results DIR] [--no-suffix-sharing]
+//!
+//! `--no-suffix-sharing` shares prefixes only, reproducing that kernel's bits.
 //!
 //! `--write-results DIR` writes every pair's result as little-endian f64 in region order to
 //! `DIR/<dump stem>.<mode>.f64` (and the recorded GATK values to `<stem>.expected.f64`) so two
@@ -14,7 +16,7 @@ use std::io::{BufRead, BufReader};
 use std::time::Instant;
 
 use fgkl_pairhmm::synthetic::Read;
-use fgkl_pairhmm::{Backend, Config, PairHmm, Precision, ReadRef};
+use fgkl_pairhmm::{Backend, Config, PairHmm, Precision, ReadRef, shared_columns};
 
 struct Region {
     reads: Vec<Read>,
@@ -162,6 +164,7 @@ fn main() {
     let mut only_region: Option<usize> = None;
     let mut dump_region: Option<(usize, String)> = None;
     let mut write_results: Option<String> = None;
+    let mut share_suffixes = true;
     let mut rest = args[1..].iter();
     let value = |flag: &str, v: Option<&String>| -> String {
         v.cloned().unwrap_or_else(|| panic!("{flag} needs a value"))
@@ -173,6 +176,7 @@ fn main() {
             "--max-regions" => max_regions = value(flag, rest.next()).parse().unwrap(),
             "--only-region" => only_region = Some(value(flag, rest.next()).parse().unwrap()),
             "--write-results" => write_results = Some(value(flag, rest.next())),
+            "--no-suffix-sharing" => share_suffixes = false,
             "--dump-region" => {
                 let index = value(flag, rest.next()).parse().unwrap();
                 dump_region = Some((index, value(flag, rest.next())));
@@ -205,26 +209,25 @@ fn main() {
             rb * hb
         })
         .sum();
-    let shared: u64 = regions
-        .iter()
-        .map(|r| {
-            let mut haps: Vec<&[u8]> = r.haps.iter().map(Vec::as_slice).collect();
-            haps.sort();
-            let rb: u64 = r.reads.iter().map(|x| x.bases.len() as u64).sum();
-            let lcp: u64 = haps
-                .windows(2)
-                .map(|w| w[0].iter().zip(w[1]).take_while(|(a, b)| a == b).count() as u64)
-                .sum();
-            rb * lcp
-        })
-        .sum();
+    let (mut prefix_cells, mut forward_cells, mut backward_cells) = (0u64, 0u64, 0u64);
+    for r in &regions {
+        let read_bases: u64 = r.reads.iter().map(|x| x.bases.len() as u64).sum();
+        let haps: Vec<&[u8]> = r.haps.iter().map(Vec::as_slice).collect();
+        let columns = shared_columns(&haps);
+        prefix_cells += read_bases * columns.prefix_only;
+        forward_cells += read_bases * columns.forward;
+        backward_cells += read_bases * columns.backward;
+    }
+    let pct = |c: u64| 100.0 * c as f64 / cells as f64;
     println!(
-        "regions={} pairs={} cells={} prefix-shared cells={} ({:.1}%) mean haps/region={:.1} mean reads/region={:.1}",
+        "regions={} pairs={} cells={} computed: prefix sharing {:.1}%, with suffix sharing {:.1}% (forward {:.1}% + backward {:.1}%); mean haps/region={:.1} mean reads/region={:.1}",
         regions.len(),
         pairs,
         cells,
-        shared,
-        100.0 * shared as f64 / cells as f64,
+        pct(prefix_cells),
+        pct(forward_cells + backward_cells),
+        pct(forward_cells),
+        pct(backward_cells),
         regions.iter().map(|r| r.haps.len()).sum::<usize>() as f64 / regions.len() as f64,
         regions.iter().map(|r| r.reads.len()).sum::<usize>() as f64 / regions.len() as f64
     );
@@ -239,8 +242,12 @@ fn main() {
         Mode { label: "double", precision: Precision::Double, double_fallback: true },
     ];
     for mode in modes {
-        let config =
-            Config { precision: mode.precision, backend, double_fallback: mode.double_fallback };
+        let config = Config {
+            precision: mode.precision,
+            backend,
+            double_fallback: mode.double_fallback,
+            share_suffixes,
+        };
         let hmm = PairHmm::new(&config).unwrap();
         let mut worst = 0.0f64;
         let mut best = f64::INFINITY;

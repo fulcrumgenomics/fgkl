@@ -79,6 +79,24 @@ pub struct Region {
     pub haplotypes: Vec<Vec<u8>>,
 }
 
+/// `base` with one to three random substitutions, single-base insertions or single-base
+/// deletions drawn from `alphabet`; never shorter than one base.
+pub fn edited(rng: &mut Rng, alphabet: &[u8], base: &[u8]) -> Vec<u8> {
+    let mut hap = base.to_vec();
+    for _ in 0..1 + rng.below(3) {
+        let pos = rng.below(hap.len());
+        match rng.below(3) {
+            0 => hap[pos] = alphabet[rng.below(alphabet.len())],
+            1 => hap.insert(pos, alphabet[rng.below(alphabet.len())]),
+            _ if hap.len() > 1 => {
+                hap.remove(pos);
+            }
+            _ => {}
+        }
+    }
+    hap
+}
+
 impl Region {
     /// Generates a region with `num_reads` reads of up to `read_len` bases and `num_haplotypes`
     /// haplotypes derived from a reference of `hap_len` bases.

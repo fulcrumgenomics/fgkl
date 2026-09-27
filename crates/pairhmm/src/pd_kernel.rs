@@ -153,6 +153,18 @@ impl HapSet for SortedPdHaps<'_> {
         SortedPdHaps::new(&[PdHaplotype { bases: self.bases[k], flags: self.flags[k] }])
     }
 
+    fn without_suffix_sharing(&self) -> Self {
+        // The PD kernel shares prefixes only. Rebuilding from the sorted haplotypes keeps their
+        // order, since sorting is stable.
+        let haps: Vec<PdHaplotype<'_>> = self
+            .bases
+            .iter()
+            .zip(&self.flags)
+            .map(|(&bases, &flags)| PdHaplotype { bases, flags })
+            .collect();
+        SortedPdHaps::new(&haps)
+    }
+
     fn lanes(key: RunnerKey) -> usize {
         with_pd_runner(key, |runner| runner.lanes())
     }
@@ -298,7 +310,13 @@ impl<S: Simd> PdRunner<S> {
             }
             ws.run_hap(haps, k, start);
             for lane in 0..reads.len() {
-                out[lane * n_haps + k] = finish_lane::<S::Elem>(ws.acc[lane], lane, k, fallback);
+                out[lane * n_haps + k] = finish_lane::<S::Elem>(
+                    ws.acc[lane].to_f64(),
+                    S::Elem::MIN_ACCEPTED,
+                    lane,
+                    k,
+                    fallback,
+                );
             }
         }
     }
