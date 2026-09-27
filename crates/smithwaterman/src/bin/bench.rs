@@ -34,12 +34,7 @@ fn main() {
             "--ref-len" => ref_len = v.parse().unwrap(),
             "--alt-len" => alt_len = v.parse().unwrap(),
             "--iters" => iters = v.parse().unwrap(),
-            "--backend" => {
-                backend = *Backend::all()
-                    .iter()
-                    .find(|b| b.name() == v)
-                    .unwrap_or_else(|| panic!("unknown backend {v}"))
-            }
+            "--backend" => backend = v.parse().unwrap(),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -58,9 +53,10 @@ fn main() {
     }
     let params = SwParameters::new(200, -150, -260, -11);
     let cells: u64 = data.iter().map(|(r, a)| (r.len() * a.len()) as u64).sum();
-    let aligner = || Aligner::with_backend(backend).expect("backend not available on this CPU");
+    let make_aligner =
+        || Aligner::with_backend(backend).expect("backend not available on this CPU");
     for (label, mut aligner) in
-        [("aligner:  ", aligner()), ("wide only:", aligner().without_narrow_lanes())]
+        [("aligner:  ", make_aligner()), ("wide only:", make_aligner().without_narrow_lanes())]
     {
         let mut best = f64::INFINITY;
         for _ in 0..iters {

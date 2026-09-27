@@ -75,8 +75,9 @@ pub trait SimdInt: Copy + Send + Sync + 'static {
     /// `dst` must point to at least `LANES` writable bytes.
     #[inline(always)]
     unsafe fn store_low_bytes_ptr(self, dst: *mut u8) {
+        const { assert!(Self::LANES <= 64) };
         let mut tmp = [Self::Elem::FLOOR; 64];
-        // SAFETY: `tmp` holds 64 elements, more than any backend's `LANES`.
+        // SAFETY: `tmp` holds 64 elements, at least `LANES` by the assert above.
         unsafe { self.store_ptr(tmp.as_mut_ptr()) };
         for (k, v) in tmp[..Self::LANES].iter().enumerate() {
             // SAFETY: `k < LANES` and the caller guarantees `LANES` writable bytes.
