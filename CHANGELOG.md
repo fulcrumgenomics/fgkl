@@ -4,6 +4,10 @@ Notable changes to fgkl, newest first. The format follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Changed
+
+- Smith-Waterman: the anti-diagonal fill is 1.3-2.2x faster (2.2x on NEON, 1.6x on AVX2, 1.3-1.6x on AVX-512), checking bounds once per anti-diagonal and no longer clearing the traceback buffer on every call. Alignments are unchanged.
+
 ## [0.1.0] - 2026-09-27
 
 First release: Rust kernels for GATK behind the `org.broadinstitute:gatk-native-bindings:1.1.0` interfaces, so GATK can replace Intel GKL with a dependency swap.
