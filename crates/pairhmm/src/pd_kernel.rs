@@ -298,7 +298,8 @@ impl<S: Simd> PdRunner<S> {
             }
             ws.run_hap(haps, k, start);
             for lane in 0..reads.len() {
-                out[lane * n_haps + k] = finish_lane::<S::Elem>(ws.acc[lane], lane, k, fallback);
+                out[lane * n_haps + k] =
+                    finish_lane::<S::Elem>(ws.acc[lane].to_f64(), lane, k, fallback);
             }
         }
     }

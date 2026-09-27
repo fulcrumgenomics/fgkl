@@ -86,7 +86,12 @@ fn main() {
     let mut out = vec![0.0; reads.len() * n_haps];
     for &backend in &backends {
         for &precision in &precisions {
-            let config = Config { precision, backend: Some(backend), double_fallback: true };
+            let config = Config {
+                precision,
+                backend: Some(backend),
+                double_fallback: true,
+                share_suffixes: true,
+            };
             let hmm = PdPairHmm::new(&config).unwrap();
             hmm.compute_log10_likelihoods(&reads, &haps, &mut out).unwrap();
             let mut best = f64::INFINITY;

@@ -318,7 +318,7 @@ fn backend_name<'local>(env: &mut Env<'local>) -> Result<JObject<'local>, Failur
 
 fn config(double_precision: jboolean) -> Config {
     let precision = if double_precision { Precision::Double } else { Precision::Float };
-    Config { precision, backend: None, double_fallback: true }
+    Config { precision, backend: None, double_fallback: true, share_suffixes: true }
 }
 
 /// Checks the Java output array holds exactly `expected` elements.

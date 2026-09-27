@@ -207,7 +207,7 @@ fn main() {
         "backend", "prec", "ms", "Mcells/s", "max|err|", "fallbacks", "checksum"
     );
     for precision in [Precision::Float, Precision::Double] {
-        let config = Config { precision, backend, double_fallback: true };
+        let config = Config { precision, backend, double_fallback: true, share_suffixes: true };
         let hmm = PdPairHmm::new(&config).unwrap();
         let mut worst = 0.0f64;
         let mut best = f64::INFINITY;
