@@ -237,9 +237,10 @@ fn make_pd_runner(key: RunnerKey) -> Box<dyn PdBatchRunner> {
     use simd::{ScalarF32, ScalarF64};
     #[cfg(target_arch = "x86_64")]
     if key.backend == Backend::Avx512 && !key.wide {
+        // A region's last few reads, at most half a batch, run on 256-bit lanes.
         return match key.precision {
-            Precision::Float => Box::new(PdRunner::<simd::x86::Avx512F32Narrow>::new()),
-            Precision::Double => Box::new(PdRunner::<simd::x86::Avx512F64Narrow>::new()),
+            Precision::Float => Box::new(PdRunner::<simd::x86::Avx2F32>::new()),
+            Precision::Double => Box::new(PdRunner::<simd::x86::Avx2F64>::new()),
         };
     }
     match (key.backend, key.precision) {
@@ -383,10 +384,6 @@ pd_runner_impl!(crate::simd::x86::Avx2F64, "avx2,fma");
 pd_runner_impl!(crate::simd::x86::Avx512F32, "avx512f");
 #[cfg(target_arch = "x86_64")]
 pd_runner_impl!(crate::simd::x86::Avx512F64, "avx512f");
-#[cfg(target_arch = "x86_64")]
-pd_runner_impl!(crate::simd::x86::Avx512F32Narrow, "avx512f");
-#[cfg(target_arch = "x86_64")]
-pd_runner_impl!(crate::simd::x86::Avx512F64Narrow, "avx512f");
 
 /// One DP row for every column, lane-interleaved: match, insertion and deletion values plus
 /// the three branch values, which are only written at `DEL_END` columns.

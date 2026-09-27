@@ -166,9 +166,10 @@ fn make_runner(key: RunnerKey) -> Box<dyn BatchRunner> {
     use simd::{ScalarF32, ScalarF64};
     #[cfg(target_arch = "x86_64")]
     if key.backend == Backend::Avx512 && !key.wide {
+        // A region's last few reads, at most half a batch, run on 256-bit lanes.
         return match key.precision {
-            Precision::Float => Box::new(Runner::<simd::x86::Avx512F32Narrow>::new()),
-            Precision::Double => Box::new(Runner::<simd::x86::Avx512F64Narrow>::new()),
+            Precision::Float => Box::new(Runner::<simd::x86::Avx2F32>::new()),
+            Precision::Double => Box::new(Runner::<simd::x86::Avx2F64>::new()),
         };
     }
     match (key.backend, key.precision) {
@@ -338,10 +339,6 @@ runner_impl!(crate::simd::x86::Avx2F64, "avx2,fma");
 runner_impl!(crate::simd::x86::Avx512F32, "avx512f");
 #[cfg(target_arch = "x86_64")]
 runner_impl!(crate::simd::x86::Avx512F64, "avx512f");
-#[cfg(target_arch = "x86_64")]
-runner_impl!(crate::simd::x86::Avx512F32Narrow, "avx512f");
-#[cfg(target_arch = "x86_64")]
-runner_impl!(crate::simd::x86::Avx512F64Narrow, "avx512f");
 
 /// Vectors per column of a forward row: match, insertion and deletion, stored in that order so
 /// the inner loop reaches all three from one pointer.
