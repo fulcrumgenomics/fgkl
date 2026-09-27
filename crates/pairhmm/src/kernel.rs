@@ -502,26 +502,43 @@ impl<S: Simd> Workspace<S> {
         let num_codes = haps.num_codes();
         self.rows = rows;
         self.num_codes = num_codes;
-        self.trans.resize(rows * NUM_TRANSITIONS * lanes, S::Elem::ZERO);
-        self.prior.resize(rows * num_codes * lanes, S::Elem::ZERO);
+        // Filled row by row, each element written once, so every write lands in the row's block
+        // of the tables. Rows past a read's end and lanes without a read hold zeros.
+        let code_bytes: Vec<u8> = (0..num_codes).map(|code| haps.byte_of_code(code)).collect();
+        self.trans.resize_no_fill(rows * NUM_TRANSITIONS * lanes);
+        self.prior.resize_no_fill(rows * num_codes * lanes);
+        for r in 0..rows {
+            let trans_row =
+                &mut self.trans[r * NUM_TRANSITIONS * lanes..][..NUM_TRANSITIONS * lanes];
+            let prior_row = &mut self.prior[r * num_codes * lanes..][..num_codes * lanes];
+            for lane in 0..lanes {
+                let Some(read) = reads.get(lane).filter(|read| r < read.len()) else {
+                    for k in 0..NUM_TRANSITIONS {
+                        trans_row[k * lanes + lane] = S::Elem::ZERO;
+                    }
+                    for code in 0..num_codes {
+                        prior_row[code * lanes + lane] = S::Elem::ZERO;
+                    }
+                    continue;
+                };
+                let t = TABLES.transitions(read.ins_gop[r], read.del_gop[r], read.gcp[r]);
+                for (k, &prob) in t.iter().enumerate() {
+                    trans_row[k * lanes + lane] = S::Elem::from_f64(prob);
+                }
+                let (p_match, p_mismatch) = TABLES.priors(read.quals[r]);
+                let (p_match, p_mismatch) =
+                    (S::Elem::from_f64(p_match), S::Elem::from_f64(p_mismatch));
+                let read_base = read.bases[r];
+                for (code, &hap_base) in code_bytes.iter().enumerate() {
+                    let matches = read_base == hap_base || read_base == b'N' || hap_base == b'N';
+                    prior_row[code * lanes + lane] = if matches { p_match } else { p_mismatch };
+                }
+            }
+        }
         self.end_mul.resize(rows * lanes, S::Elem::ZERO);
         self.end_rows.clear();
         self.end_rows.resize(rows, false);
         for (lane, read) in reads.iter().enumerate() {
-            for r in 0..read.len() {
-                let t = TABLES.transitions(read.ins_gop[r], read.del_gop[r], read.gcp[r]);
-                for (k, &prob) in t.iter().enumerate() {
-                    self.trans[(r * NUM_TRANSITIONS + k) * lanes + lane] = S::Elem::from_f64(prob);
-                }
-                let (p_match, p_mismatch) = TABLES.priors(read.quals[r]);
-                let read_base = read.bases[r];
-                for code in 0..num_codes {
-                    let hap_base = haps.byte_of_code(code);
-                    let matches = read_base == hap_base || read_base == b'N' || hap_base == b'N';
-                    let p = if matches { p_match } else { p_mismatch };
-                    self.prior[(r * num_codes + code) * lanes + lane] = S::Elem::from_f64(p);
-                }
-            }
             self.end_mul[(read.len() - 1) * lanes + lane] = S::Elem::ONE;
             self.end_rows[read.len() - 1] = true;
         }
@@ -626,6 +643,7 @@ impl<S: Simd> Workspace<S> {
         let trans: &[S::Elem] = trans;
         let prior: &[S::Elem] = prior;
         let end_mul: &[S::Elem] = end_mul;
+        let codes = Codes::new(codes, num_codes);
         let zero = S::zero();
         let init = S::splat(S::Elem::from_f64(S::Elem::INITIAL_CONSTANT.to_f64() / hap_len as f64));
         let scale = S::splat(S::Elem::from_f64(src.hap_len as f64 / hap_len as f64));
@@ -663,63 +681,75 @@ impl<S: Simd> Workspace<S> {
             };
             let prev = RowView { m: &row_prev.m, x: &row_prev.x, y: &row_prev.y };
             let mut cur = RowViewMut { m: &mut row_cur.m, x: &mut row_cur.x, y: &mut row_cur.y };
-            let ends_here = end_rows[r];
             let mut rowsum = zero;
-            let mut lo = start;
-            let mut seg = 0;
-            loop {
-                let (hi, is_snapshot) =
-                    if seg < snap_cols.len() { (snap_cols[seg], true) } else { (stop, false) };
-                if hi > lo {
-                    state = if ends_here {
-                        dp_segment::<S, true>(
+            if end_rows[r] {
+                // A read ends on this row, so every snapshot also needs the row's sum up to its
+                // column: sweep segment by segment.
+                let e = S::load(&end_mul[r * lanes..]);
+                let mut lo = start;
+                for &q in snap_cols.iter() {
+                    if q > lo {
+                        state = dp_segment::<S, true>(
                             &t,
                             prior_row,
                             codes,
                             lo,
-                            hi,
+                            q,
                             &prev,
                             &mut cur,
                             state,
                             &mut rowsum,
-                        )
-                    } else {
-                        dp_segment::<S, false>(
-                            &t,
-                            prior_row,
-                            codes,
-                            lo,
-                            hi,
-                            &prev,
-                            &mut cur,
-                            state,
-                            &mut rowsum,
-                        )
-                    };
-                }
-                if is_snapshot {
-                    let snap = &mut after[hi - start - 1];
+                        );
+                    }
+                    let snap = &mut after[q - start - 1];
                     state.m_left.store(&mut snap.m[i * lanes..]);
                     state.x_left.store(&mut snap.x[i * lanes..]);
                     state.y_left.store(&mut snap.y[i * lanes..]);
-                    if ends_here {
-                        let e = S::load(&end_mul[r * lanes..]);
-                        e.mul_add(rowsum, S::load(&snap.acc)).store(&mut snap.acc);
-                    }
-                } else {
-                    break;
+                    e.mul_add(rowsum, S::load(&snap.acc)).store(&mut snap.acc);
+                    lo = q;
                 }
-                lo = hi;
-                seg += 1;
-            }
-            if ends_here {
-                acc_v = S::load(&end_mul[r * lanes..]).mul_add(rowsum, acc_v);
+                if stop > lo {
+                    state = dp_segment::<S, true>(
+                        &t,
+                        prior_row,
+                        codes,
+                        lo,
+                        stop,
+                        &prev,
+                        &mut cur,
+                        state,
+                        &mut rowsum,
+                    );
+                }
+                acc_v = e.mul_add(rowsum, acc_v);
+            } else {
+                // One sweep over the row, then the snapshot columns copied out of it.
+                if stop > start {
+                    state = dp_segment::<S, false>(
+                        &t,
+                        prior_row,
+                        codes,
+                        start,
+                        stop,
+                        &prev,
+                        &mut cur,
+                        state,
+                        &mut rowsum,
+                    );
+                }
+                for &q in snap_cols.iter() {
+                    let snap = &mut after[q - start - 1];
+                    let col = q * lanes..(q + 1) * lanes;
+                    snap.m[i * lanes..][..lanes].copy_from_slice(&cur.m[col.clone()]);
+                    snap.x[i * lanes..][..lanes].copy_from_slice(&cur.x[col.clone()]);
+                    snap.y[i * lanes..][..lanes].copy_from_slice(&cur.y[col]);
+                }
             }
             if join {
                 // The cells of column stop + 1 as `dp_segment` would compute them. Its insertion
                 // value is not needed: insertions stay within a column, so paths enter it only
                 // through match or deletion.
-                let prior = S::load(&prior_row[codes[stop] as usize * lanes..]);
+                let prior = S::load(&prior_row[codes.codes[stop] as usize * lanes..]);
                 let st = &state;
                 let m = prior
                     .mul(st.y_diag.mul_add(t.im, st.x_diag.mul_add(t.im, st.m_diag.mul(t.mm))));
@@ -741,16 +771,17 @@ impl<S: Simd> Workspace<S> {
     fn join(&mut self, node: usize, hap_len: usize) {
         let lanes = S::LANES;
         let node = &self.bwd_nodes[node];
-        let crossing = &mut self.joined;
+        let crossing = &mut self.joined[..lanes];
         crossing.fill(0.0);
         for i in 1..=self.rows {
-            let row = i * lanes..(i + 1) * lanes;
-            let terms = self.join_m[row.clone()]
-                .iter()
-                .zip(&node.m[row.clone()])
-                .zip(self.join_y[row.clone()].iter().zip(&node.y[row]));
-            for (sum, ((&fm, &bm), (&fy, &by))) in crossing.iter_mut().zip(terms) {
-                *sum += fm.to_f64() * bm.to_f64() + fy.to_f64() * by.to_f64();
+            // Slices of exactly `lanes` elements, a compile-time constant, so the loop below
+            // vectorises.
+            let fm = &self.join_m[i * lanes..][..lanes];
+            let bm = &node.m[i * lanes..][..lanes];
+            let fy = &self.join_y[i * lanes..][..lanes];
+            let by = &node.y[i * lanes..][..lanes];
+            for l in 0..lanes {
+                crossing[l] += fm[l].to_f64() * bm[l].to_f64() + fy[l].to_f64() * by[l].to_f64();
             }
         }
         // The rounded initial value the forward sweep used, so both halves weight starts alike.
@@ -776,6 +807,7 @@ impl<S: Simd> Workspace<S> {
         let start = std::mem::replace(&mut self.bwd_nodes[sweep.start], BackwardNode::new());
         let Workspace { trans, prior, end_mul, end_rows, bwd_prev, bwd_cur, bwd_nodes, .. } = self;
         let trans: &[S::Elem] = trans;
+        let codes = Codes::new(codes, num_codes);
         let zero = S::zero();
         let scale = S::splat(S::Elem::BACKWARD_SCALE);
         // Nothing lies below the last row.
@@ -923,6 +955,22 @@ impl<S: Simd> Transitions<S> {
     }
 }
 
+/// A haplotype's prior-table codes, each checked once to be below `num_codes`, so the sweeps can
+/// index a prior row of `num_codes` entries with one length check per segment rather than a pass
+/// over the codes on every row.
+#[derive(Clone, Copy)]
+struct Codes<'a> {
+    codes: &'a [u8],
+    num_codes: usize,
+}
+
+impl<'a> Codes<'a> {
+    fn new(codes: &'a [u8], num_codes: usize) -> Self {
+        assert!(codes.iter().all(|&c| (c as usize) < num_codes));
+        Codes { codes, num_codes }
+    }
+}
+
 /// The neighbours of the next cell in a row sweep: the previous row's values one column back and
 /// the current row's values one column back.
 #[derive(Clone, Copy)]
@@ -942,7 +990,7 @@ pub(crate) struct CellState<S> {
 fn dp_segment<S: Simd, const ACC: bool>(
     t: &Transitions<S>,
     prior_row: &[S::Elem],
-    codes: &[u8],
+    codes: Codes<'_>,
     lo: usize,
     hi: usize,
     prev: &RowView<'_, S::Elem>,
@@ -958,16 +1006,16 @@ fn dp_segment<S: Simd, const ACC: bool>(
     let end = (hi + 1) * lanes;
     assert!(prev.m.len() >= end && prev.x.len() >= end && prev.y.len() >= end);
     assert!(cur.m.len() >= end && cur.x.len() >= end && cur.y.len() >= end);
-    let codes = &codes[lo..hi];
-    let num_codes = prior_row.len() / lanes;
-    assert!(codes.iter().all(|&c| (c as usize) < num_codes));
+    assert!(prior_row.len() >= codes.num_codes * lanes);
+    let codes = &codes.codes[lo..hi];
     let (prev_m, prev_x, prev_y) = (prev.m.as_ptr(), prev.x.as_ptr(), prev.y.as_ptr());
     let (cur_m, cur_x, cur_y) = (cur.m.as_mut_ptr(), cur.x.as_mut_ptr(), cur.y.as_mut_ptr());
     let priors = prior_row.as_ptr();
     for (k, &code) in codes.iter().enumerate() {
         let off = (lo + 1 + k) * lanes;
-        // SAFETY: `off + lanes <= end` and `(code + 1) * lanes <= prior_row.len()` by the checks
-        // above, and the previous and current rows are distinct buffers.
+        // SAFETY: `off + lanes <= end` by the checks above, `(code + 1) * lanes <= prior_row.len()`
+        // since `Codes` holds only codes below `num_codes`, and the previous and current rows are
+        // distinct buffers.
         let (prior, m_up, x_up, y_up) = unsafe {
             (
                 S::load_ptr(priors.add(code as usize * lanes)),
@@ -1027,7 +1075,7 @@ fn backward_segment<S: Simd, const SINK: bool>(
     md: S,
     dd: S,
     prior_row: &[S::Elem],
-    codes: &[u8],
+    codes: Codes<'_>,
     lo: usize,
     hi: usize,
     prev: &BackwardRowView<'_, S::Elem>,
@@ -1042,16 +1090,14 @@ fn backward_segment<S: Simd, const SINK: bool>(
     assert!(prev.m.len() >= end && prev.x.len() >= end);
     assert!(cur.m.len() >= end && cur.x.len() >= end);
     // Moving from column j to j + 1 emits haplotype base j + 1, whose code is `codes[j]`.
-    let codes = &codes[lo..hi];
-    let num_codes = prior_row.len() / lanes;
-    assert!(codes.iter().all(|&c| (c as usize) < num_codes));
+    assert!(prior_row.len() >= codes.num_codes * lanes);
+    let codes = &codes.codes[lo..hi];
     let (prev_m, prev_x) = (prev.m.as_ptr(), prev.x.as_ptr());
     let (cur_m, cur_x) = (cur.m.as_mut_ptr(), cur.x.as_mut_ptr());
     let priors = prior_row.as_ptr();
     for (k, &code) in codes.iter().enumerate().rev() {
         let off = (lo + k) * lanes;
-        // SAFETY: `off + lanes <= end` and `(code + 1) * lanes <= prior_row.len()` by the checks
-        // above, and the previous and current rows are distinct buffers.
+        // SAFETY: as in `dp_segment`.
         let (prior, bx_below, bm_below) = unsafe {
             (
                 S::load_ptr(priors.add(code as usize * lanes)),
@@ -1086,7 +1132,7 @@ fn backward_segment<S: Simd, const SINK: bool>(
 fn backward_row_zero<S: Simd>(
     im: S,
     prior_row: &[S::Elem],
-    codes: &[u8],
+    codes: Codes<'_>,
     lo: usize,
     hi: usize,
     prev: &BackwardRowView<'_, S::Elem>,
@@ -1095,7 +1141,7 @@ fn backward_row_zero<S: Simd>(
 ) -> BackwardState<S> {
     let lanes = S::LANES;
     for j in (lo..hi).rev() {
-        let prior = S::load(&prior_row[codes[j] as usize * lanes..]);
+        let prior = S::load(&prior_row[codes.codes[j] as usize * lanes..]);
         let by = prior.mul(st.bm_diag).mul(im);
         *starts_after = starts_after.add(by);
         st = BackwardState {
