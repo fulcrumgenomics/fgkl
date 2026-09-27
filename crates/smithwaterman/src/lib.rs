@@ -33,6 +33,10 @@ const DIR_DELETION: u8 = 2;
 const DELETION_EXTENDS: u8 = 0b100;
 /// The best horizontal gap ending here extends the one ending in the cell to the left.
 const INSERTION_EXTENDS: u8 = 0b1000;
+/// The largest flags byte. The AVX2 16-bit fill narrows flags with a saturating pack, which
+/// equals truncation only for values that fit an `i8`.
+const MAX_FLAGS: u8 = DIR_DELETION | DELETION_EXTENDS | INSERTION_EXTENDS;
+const _: () = assert!(MAX_FLAGS <= i8::MAX as u8);
 
 /// Scoring parameters as GATK's `SWParameters`: a positive match value and negative penalties.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +246,18 @@ impl Backend {
                 Some(Box::new(DiagWorkspace::<simd::x86::I32x16>::new())),
             ),
         }
+    }
+}
+
+impl std::str::FromStr for Backend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::all()
+            .iter()
+            .copied()
+            .find(|b| b.name() == s)
+            .ok_or_else(|| format!("unknown backend '{s}'"))
     }
 }
 
@@ -965,14 +981,85 @@ mod tests {
     }
 
     #[test]
-    fn buffers_are_reused_across_calls_without_leaking_state() {
-        let mut aligner = Aligner::new();
-        let mut rng = Rng(3);
-        let (r1, a1) = related_pair(&mut rng, 300, 150);
-        let (r2, a2) = related_pair(&mut rng, 30, 20);
-        let first = aligner.align(&r1, &a1, &HAP_TO_REF, OverhangStrategy::Indel).unwrap();
-        aligner.align(&r2, &a2, &READ_TO_HAP, OverhangStrategy::SoftClip).unwrap();
-        let again = aligner.align(&r1, &a1, &HAP_TO_REF, OverhangStrategy::Indel).unwrap();
-        assert_eq!(first, again);
+    fn a_fill_writes_every_traceback_cell_its_traceback_reads() {
+        let mut rng = Rng(13);
+        let (big_ref, big_alt) = related_pair(&mut rng, 600, 520);
+        // A reference longer than the alternate and one shorter: the anti-diagonals start and
+        // end differently in the two, and so does the traceback buffer's layout.
+        let longer_reference = related_pair(&mut rng, 70, 45);
+        let (short_ref, mut long_alt) = related_pair(&mut rng, 45, 45);
+        long_alt.splice(20..20, (0..25).map(|_| rng.base()).collect::<Vec<u8>>());
+        let params = &HAP_TO_REF;
+        let strategy = OverhangStrategy::SoftClip;
+        for (r, a) in [longer_reference, (short_ref, long_alt)] {
+            for backend in Backend::available() {
+                let (narrow, wide) = backend.make_fills();
+                let (fresh_narrow, fresh_wide) = backend.make_fills();
+                for (dirty, fresh) in [(narrow, fresh_narrow), (wide, fresh_wide)] {
+                    let (Some(mut dirty), Some(mut fresh)) = (dirty, fresh) else { continue };
+                    dirty.fill(&big_ref, &big_alt, params, strategy);
+                    dirty.poison_trace(0xFF);
+                    assert_eq!(
+                        dirty.fill(&r, &a, params, strategy),
+                        fresh.fill(&r, &a, params, strategy)
+                    );
+                    for i in 1..=r.len() {
+                        for j in 1..=a.len() {
+                            assert_eq!(
+                                dirty.trace_at(i, j),
+                                fresh.trace_at(i, j),
+                                "{backend} {} x {} cell ({i}, {j})",
+                                r.len(),
+                                a.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_reused_aligner_matches_the_reference_as_pair_sizes_shrink_and_grow() {
+        let mut rng = Rng(11);
+        // The first pair is unrelated, so its 16-bit fill saturates and is redone in 32 bits:
+        // both lane widths' workspaces start the later pairs full of unrelated values.
+        let sizes = [(600, 520), (500, 150), (40, 30), (320, 310), (8, 5), (590, 600), (60, 200)];
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = sizes
+            .iter()
+            .enumerate()
+            .map(|(k, &(r, a))| {
+                if k == 0 {
+                    let reference = (0..r).map(|_| rng.base()).collect();
+                    let alt = (0..a).map(|_| rng.base()).collect();
+                    (reference, alt)
+                } else {
+                    related_pair(&mut rng, r, a)
+                }
+            })
+            .collect();
+        for backend in Backend::available() {
+            for narrow in [true, false] {
+                let mut aligner = Aligner::with_backend(backend).unwrap();
+                if !narrow {
+                    aligner = aligner.without_narrow_lanes();
+                }
+                for (r, a) in &pairs {
+                    for params in [&HAP_TO_REF, &READ_TO_HAP] {
+                        for strategy in STRATEGIES {
+                            let expected = reference::align(r, a, params, strategy);
+                            let actual = aligner.align(r, a, params, strategy).unwrap();
+                            assert_eq!(
+                                actual,
+                                expected,
+                                "{backend} narrow={narrow} {strategy:?} {} x {}",
+                                r.len(),
+                                a.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

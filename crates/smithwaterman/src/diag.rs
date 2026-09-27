@@ -43,6 +43,11 @@ pub(crate) trait DiagFill: Send {
 
     /// Traceback flags of cell `(i, j)`, both at least 1.
     fn trace_at(&self, i: usize, j: usize) -> u8;
+
+    /// Overwrites the whole traceback buffer with `byte`, so a test can show that a fill writes
+    /// every cell its traceback reads, whatever an earlier fill left there.
+    #[cfg(test)]
+    fn poison_trace(&mut self, byte: u8);
 }
 
 /// The relative encoding of one parameter set: the per-step costs and how to decode a stored
@@ -156,6 +161,9 @@ impl<V: SimdInt> DiagWorkspace<V> {
         params: &SwParameters,
         strategy: OverhangStrategy,
     ) -> Option<(usize, usize, usize)> {
+        // The anti-diagonal bounds below assume both sequences are non-empty, which `Aligner::align`
+        // guarantees by rejecting empty input.
+        debug_assert!(!reference.is_empty() && !alternate.is_empty());
         let l = V::LANES;
         let pad = l;
         let n = reference.len();
@@ -163,16 +171,17 @@ impl<V: SimdInt> DiagWorkspace<V> {
         let floor = V::Elem::FLOOR;
         let enc = Encoding::new(params, V::Elem::HEADROOM);
         self.alt_len = m;
+        let row_len = n + 2 * l + 2;
         for buf in [&mut self.h2, &mut self.h1, &mut self.h0] {
             buf.clear();
-            buf.resize(n + 2 * l + 2, V::Elem::from_i32(0));
+            buf.resize(row_len, V::Elem::from_i32(0));
         }
         for buf in [&mut self.e1, &mut self.e0, &mut self.f1, &mut self.f0] {
             buf.clear();
-            buf.resize(n + 2 * l + 2, floor);
+            buf.resize(row_len, floor);
         }
         self.reference.clear();
-        self.reference.resize(n + 2 * l + 2, V::Elem::from_i32(0));
+        self.reference.resize(row_len, V::Elem::from_i32(0));
         for (i, &b) in reference.iter().enumerate() {
             self.reference[pad + i + 1] = V::Elem::from_i32(b as i32);
         }
@@ -194,8 +203,11 @@ impl<V: SimdInt> DiagWorkspace<V> {
             }
         }
         self.diag_start[n + m + 1] = total;
-        self.trace.clear();
-        self.trace.resize(total + 2 * l, 0);
+        // Every cell the traceback can visit is written below before it is read, so the buffer
+        // only has to be long enough: zeroing it on every call would cost a pass over the matrix.
+        if self.trace.len() < total + 2 * l {
+            self.trace.resize(total + 2 * l, 0);
+        }
         for buf in [&mut self.last_col, &mut self.bottom] {
             buf.clear();
         }
@@ -231,18 +243,52 @@ impl<V: SimdInt> DiagWorkspace<V> {
             let i_lo = d.saturating_sub(m).max(1);
             let i_hi = n.min(d - 1);
             let ts = self.diag_start[d];
+            // A vector starting at row i touches rows i - 1 through i + l - 1 of the row buffers,
+            // the alternate from alt_rev index pad + m + i - d, and trace bytes from ts + i - i_lo.
+            // Vectors start at rows i_lo..=i_hi (i_lo >= 1), so these bounds cover every access.
+            let row_buffers = [
+                &self.h2,
+                &self.h1,
+                &self.h0,
+                &self.e1,
+                &self.e0,
+                &self.f1,
+                &self.f0,
+                &self.reference,
+            ];
+            assert!(
+                row_buffers.iter().all(|b| pad + i_hi + l <= b.len())
+                    && pad + m + i_hi - d + l <= self.alt_rev.len()
+                    && ts + (i_hi - i_lo) + l <= self.trace.len(),
+                "anti-diagonal {d} of a {n} x {m} fill overruns its buffers"
+            );
+            let h2 = self.h2.as_ptr();
+            let h1 = self.h1.as_ptr();
+            let e1 = self.e1.as_ptr();
+            let f1 = self.f1.as_ptr();
+            let reference = self.reference.as_ptr();
+            let alt_rev = self.alt_rev.as_ptr();
+            let h0 = self.h0.as_mut_ptr();
+            let e0 = self.e0.as_mut_ptr();
+            let f0 = self.f0.as_mut_ptr();
+            let trace = self.trace.as_mut_ptr();
             let mut i = i_lo;
             while i <= i_hi {
                 // The base paired with row i sits at alternate index d - i - 1, which is
                 // alt_rev index m - d + i; adding pad first keeps the arithmetic unsigned.
                 let alt_index = pad + m + i - d;
-                let h_diag = V::load(&self.h2[pad + i - 1..]);
-                let h_up = V::load(&self.h1[pad + i - 1..]);
-                let h_left = V::load(&self.h1[pad + i..]);
-                let f_up = V::load(&self.f1[pad + i - 1..]);
-                let e_left = V::load(&self.e1[pad + i..]);
-                let a = V::load(&self.reference[pad + i..]);
-                let b = V::load(&self.alt_rev[alt_index..]);
+                // SAFETY: in bounds by the assert above, since i_lo <= i <= i_hi.
+                let (h_diag, h_up, h_left, f_up, e_left, a, b) = unsafe {
+                    (
+                        V::load_ptr(h2.add(pad + i - 1)),
+                        V::load_ptr(h1.add(pad + i - 1)),
+                        V::load_ptr(h1.add(pad + i)),
+                        V::load_ptr(f1.add(pad + i - 1)),
+                        V::load_ptr(e1.add(pad + i)),
+                        V::load_ptr(reference.add(pad + i)),
+                        V::load_ptr(alt_rev.add(alt_index)),
+                    )
+                };
                 let diag = h_diag.add(V::select(a.eq(b), v_zero, v_mismatch));
                 let open_down = h_up.add(v_open);
                 let ext_down = f_up.add(v_extend);
@@ -259,10 +305,13 @@ impl<V: SimdInt> DiagWorkspace<V> {
                 let flags = dir
                     .add(V::select(f_open, v_zero, v_del_ext))
                     .add(V::select(e_open, v_zero, v_ins_ext));
-                score.store(&mut self.h0[pad + i..]);
-                e.store(&mut self.e0[pad + i..]);
-                f.store(&mut self.f0[pad + i..]);
-                flags.store_low_bytes(&mut self.trace[ts + (i - i_lo)..]);
+                // SAFETY: as for the loads; the written buffers are distinct from the read ones.
+                unsafe {
+                    score.store_ptr(h0.add(pad + i));
+                    e.store_ptr(e0.add(pad + i));
+                    f.store_ptr(f0.add(pad + i));
+                    flags.store_low_bytes_ptr(trace.add(ts + (i - i_lo)));
+                }
                 i += l;
             }
             if d <= m {
@@ -342,6 +391,10 @@ macro_rules! diag_fill_impl {
             fn trace_at(&self, i: usize, j: usize) -> u8 {
                 self.trace_at_impl(i, j)
             }
+            #[cfg(test)]
+            fn poison_trace(&mut self, byte: u8) {
+                self.trace.fill(byte);
+            }
         }
     };
     ($ty:ty, $features:literal) => {
@@ -368,6 +421,10 @@ macro_rules! diag_fill_impl {
             }
             fn trace_at(&self, i: usize, j: usize) -> u8 {
                 self.trace_at_impl(i, j)
+            }
+            #[cfg(test)]
+            fn poison_trace(&mut self, byte: u8) {
+                self.trace.fill(byte);
             }
         }
     };

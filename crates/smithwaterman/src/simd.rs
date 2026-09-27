@@ -48,9 +48,16 @@ pub trait SimdInt: Copy + Send + Sync + 'static {
     type Mask: Copy;
     const LANES: usize;
     fn splat(v: Self::Elem) -> Self;
-    /// Loads `LANES` values starting at `src[0]`; panics if `src` is shorter.
-    fn load(src: &[Self::Elem]) -> Self;
-    fn store(self, dst: &mut [Self::Elem]);
+    /// Loads `LANES` values starting at `src`.
+    ///
+    /// # Safety
+    /// `src` must point to at least `LANES` readable elements.
+    unsafe fn load_ptr(src: *const Self::Elem) -> Self;
+    /// Stores `LANES` values starting at `dst`.
+    ///
+    /// # Safety
+    /// `dst` must point to at least `LANES` writable elements.
+    unsafe fn store_ptr(self, dst: *mut Self::Elem);
     /// Lane-wise sum, saturating for `i16` lanes.
     fn add(self, other: Self) -> Self;
     /// Lanes where `self > other`.
@@ -61,13 +68,20 @@ pub trait SimdInt: Copy + Send + Sync + 'static {
     fn mask_not(a: Self::Mask) -> Self::Mask;
     /// `a` where the mask is set, else `b`.
     fn select(mask: Self::Mask, a: Self, b: Self) -> Self;
-    /// Stores the low byte of every lane to `dst[0..LANES]`.
+    /// Stores the low byte of every lane to the `LANES` bytes starting at `dst`. Only called with
+    /// traceback flags, which lie in `0..=14`, so a saturating narrowing is equally correct.
+    ///
+    /// # Safety
+    /// `dst` must point to at least `LANES` writable bytes.
     #[inline(always)]
-    fn store_low_bytes(self, dst: &mut [u8]) {
+    unsafe fn store_low_bytes_ptr(self, dst: *mut u8) {
+        const { assert!(Self::LANES <= 64) };
         let mut tmp = [Self::Elem::FLOOR; 64];
-        self.store(&mut tmp[..Self::LANES]);
-        for (d, v) in dst[..Self::LANES].iter_mut().zip(&tmp[..Self::LANES]) {
-            *d = v.to_i32() as u8;
+        // SAFETY: `tmp` holds 64 elements, at least `LANES` by the assert above.
+        unsafe { self.store_ptr(tmp.as_mut_ptr()) };
+        for (k, v) in tmp[..Self::LANES].iter().enumerate() {
+            // SAFETY: `k < LANES` and the caller guarantees `LANES` writable bytes.
+            unsafe { *dst.add(k) = v.to_i32() as u8 };
         }
     }
     /// Lanes where `self >= other`.
@@ -78,7 +92,7 @@ pub trait SimdInt: Copy + Send + Sync + 'static {
 }
 
 // SAFETY (whole module): NEON is part of the aarch64 baseline; loads and stores touch exactly
-// `LANES` elements of slices checked to be long enough.
+// `LANES` elements, which their callers guarantee are valid.
 #[cfg(target_arch = "aarch64")]
 pub mod neon {
     use super::SimdInt;
@@ -96,14 +110,12 @@ pub mod neon {
             I32x4(unsafe { vdupq_n_s32(v) })
         }
         #[inline(always)]
-        fn load(src: &[i32]) -> Self {
-            let src = &src[..4];
-            I32x4(unsafe { vld1q_s32(src.as_ptr()) })
+        unsafe fn load_ptr(src: *const i32) -> Self {
+            I32x4(unsafe { vld1q_s32(src) })
         }
         #[inline(always)]
-        fn store(self, dst: &mut [i32]) {
-            let dst = &mut dst[..4];
-            unsafe { vst1q_s32(dst.as_mut_ptr(), self.0) }
+        unsafe fn store_ptr(self, dst: *mut i32) {
+            unsafe { vst1q_s32(dst, self.0) }
         }
         #[inline(always)]
         fn add(self, other: Self) -> Self {
@@ -143,14 +155,12 @@ pub mod neon {
             I16x8(unsafe { vdupq_n_s16(v) })
         }
         #[inline(always)]
-        fn load(src: &[i16]) -> Self {
-            let src = &src[..8];
-            I16x8(unsafe { vld1q_s16(src.as_ptr()) })
+        unsafe fn load_ptr(src: *const i16) -> Self {
+            I16x8(unsafe { vld1q_s16(src) })
         }
         #[inline(always)]
-        fn store(self, dst: &mut [i16]) {
-            let dst = &mut dst[..8];
-            unsafe { vst1q_s16(dst.as_mut_ptr(), self.0) }
+        unsafe fn store_ptr(self, dst: *mut i16) {
+            unsafe { vst1q_s16(dst, self.0) }
         }
         #[inline(always)]
         fn add(self, other: Self) -> Self {
@@ -177,9 +187,8 @@ pub mod neon {
             I16x8(unsafe { vbslq_s16(mask, a.0, b.0) })
         }
         #[inline(always)]
-        fn store_low_bytes(self, dst: &mut [u8]) {
-            let dst = &mut dst[..8];
-            unsafe { vst1_s8(dst.as_mut_ptr() as *mut i8, vmovn_s16(self.0)) }
+        unsafe fn store_low_bytes_ptr(self, dst: *mut u8) {
+            unsafe { vst1_s8(dst as *mut i8, vmovn_s16(self.0)) }
         }
     }
 }
@@ -190,8 +199,8 @@ pub mod x86 {
     use core::arch::x86_64::*;
 
     // SAFETY (this module): only instantiated inside functions compiled with the matching
-    // target features after runtime detection; loads and stores touch exactly `LANES` elements
-    // of slices checked to be long enough.
+    // target features after runtime detection; loads and stores touch exactly `LANES` elements,
+    // which their callers guarantee are valid.
 
     #[derive(Clone, Copy)]
     pub struct I32x8(__m256i);
@@ -205,14 +214,12 @@ pub mod x86 {
             I32x8(unsafe { _mm256_set1_epi32(v) })
         }
         #[inline(always)]
-        fn load(src: &[i32]) -> Self {
-            let src = &src[..8];
-            I32x8(unsafe { _mm256_loadu_si256(src.as_ptr() as *const __m256i) })
+        unsafe fn load_ptr(src: *const i32) -> Self {
+            I32x8(unsafe { _mm256_loadu_si256(src as *const __m256i) })
         }
         #[inline(always)]
-        fn store(self, dst: &mut [i32]) {
-            let dst = &mut dst[..8];
-            unsafe { _mm256_storeu_si256(dst.as_mut_ptr() as *mut __m256i, self.0) }
+        unsafe fn store_ptr(self, dst: *mut i32) {
+            unsafe { _mm256_storeu_si256(dst as *mut __m256i, self.0) }
         }
         #[inline(always)]
         fn add(self, other: Self) -> Self {
@@ -252,14 +259,12 @@ pub mod x86 {
             I16x16(unsafe { _mm256_set1_epi16(v) })
         }
         #[inline(always)]
-        fn load(src: &[i16]) -> Self {
-            let src = &src[..16];
-            I16x16(unsafe { _mm256_loadu_si256(src.as_ptr() as *const __m256i) })
+        unsafe fn load_ptr(src: *const i16) -> Self {
+            I16x16(unsafe { _mm256_loadu_si256(src as *const __m256i) })
         }
         #[inline(always)]
-        fn store(self, dst: &mut [i16]) {
-            let dst = &mut dst[..16];
-            unsafe { _mm256_storeu_si256(dst.as_mut_ptr() as *mut __m256i, self.0) }
+        unsafe fn store_ptr(self, dst: *mut i16) {
+            unsafe { _mm256_storeu_si256(dst as *mut __m256i, self.0) }
         }
         #[inline(always)]
         fn add(self, other: Self) -> Self {
@@ -286,6 +291,17 @@ pub mod x86 {
             // Mask lanes are all-ones or all-zeros, so a byte-granular blend selects whole lanes.
             I16x16(unsafe { _mm256_blendv_epi8(b.0, a.0, mask) })
         }
+        #[inline(always)]
+        unsafe fn store_low_bytes_ptr(self, dst: *mut u8) {
+            // Traceback flags lie in 0..=14, so the saturating pack keeps every low byte.
+            unsafe {
+                let packed = _mm_packs_epi16(
+                    _mm256_castsi256_si128(self.0),
+                    _mm256_extracti128_si256::<1>(self.0),
+                );
+                _mm_storeu_si128(dst as *mut __m128i, packed)
+            }
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -300,14 +316,12 @@ pub mod x86 {
             I32x16(unsafe { _mm512_set1_epi32(v) })
         }
         #[inline(always)]
-        fn load(src: &[i32]) -> Self {
-            let src = &src[..16];
-            I32x16(unsafe { _mm512_loadu_si512(src.as_ptr() as *const __m512i) })
+        unsafe fn load_ptr(src: *const i32) -> Self {
+            I32x16(unsafe { _mm512_loadu_si512(src as *const __m512i) })
         }
         #[inline(always)]
-        fn store(self, dst: &mut [i32]) {
-            let dst = &mut dst[..16];
-            unsafe { _mm512_storeu_si512(dst.as_mut_ptr() as *mut __m512i, self.0) }
+        unsafe fn store_ptr(self, dst: *mut i32) {
+            unsafe { _mm512_storeu_si512(dst as *mut __m512i, self.0) }
         }
         #[inline(always)]
         fn add(self, other: Self) -> Self {
@@ -334,11 +348,8 @@ pub mod x86 {
             I32x16(unsafe { _mm512_mask_blend_epi32(mask, b.0, a.0) })
         }
         #[inline(always)]
-        fn store_low_bytes(self, dst: &mut [u8]) {
-            let dst = &mut dst[..16];
-            unsafe {
-                _mm_storeu_si128(dst.as_mut_ptr() as *mut __m128i, _mm512_cvtepi32_epi8(self.0))
-            }
+        unsafe fn store_low_bytes_ptr(self, dst: *mut u8) {
+            unsafe { _mm_storeu_si128(dst as *mut __m128i, _mm512_cvtepi32_epi8(self.0)) }
         }
     }
 
@@ -354,14 +365,12 @@ pub mod x86 {
             I16x32(unsafe { _mm512_set1_epi16(v) })
         }
         #[inline(always)]
-        fn load(src: &[i16]) -> Self {
-            let src = &src[..32];
-            I16x32(unsafe { _mm512_loadu_si512(src.as_ptr() as *const __m512i) })
+        unsafe fn load_ptr(src: *const i16) -> Self {
+            I16x32(unsafe { _mm512_loadu_si512(src as *const __m512i) })
         }
         #[inline(always)]
-        fn store(self, dst: &mut [i16]) {
-            let dst = &mut dst[..32];
-            unsafe { _mm512_storeu_si512(dst.as_mut_ptr() as *mut __m512i, self.0) }
+        unsafe fn store_ptr(self, dst: *mut i16) {
+            unsafe { _mm512_storeu_si512(dst as *mut __m512i, self.0) }
         }
         #[inline(always)]
         fn add(self, other: Self) -> Self {
@@ -388,11 +397,8 @@ pub mod x86 {
             I16x32(unsafe { _mm512_mask_blend_epi16(mask, b.0, a.0) })
         }
         #[inline(always)]
-        fn store_low_bytes(self, dst: &mut [u8]) {
-            let dst = &mut dst[..32];
-            unsafe {
-                _mm256_storeu_si256(dst.as_mut_ptr() as *mut __m256i, _mm512_cvtepi16_epi8(self.0))
-            }
+        unsafe fn store_low_bytes_ptr(self, dst: *mut u8) {
+            unsafe { _mm256_storeu_si256(dst as *mut __m256i, _mm512_cvtepi16_epi8(self.0)) }
         }
     }
 }

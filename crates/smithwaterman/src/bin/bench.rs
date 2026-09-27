@@ -1,9 +1,9 @@
 //! Throughput of the aligner on synthetic haplotype-to-reference and read-to-haplotype pairs.
-//! Usage: sw-bench [--pairs N] [--ref-len N] [--alt-len N] [--iters N]
+//! Usage: sw-bench [--pairs N] [--ref-len N] [--alt-len N] [--iters N] [--backend NAME]
 
 use std::time::Instant;
 
-use fgkl_smithwaterman::{Aligner, OverhangStrategy, SwParameters, reference};
+use fgkl_smithwaterman::{Aligner, Backend, OverhangStrategy, SwParameters, reference};
 
 struct Rng(u64);
 
@@ -25,6 +25,7 @@ fn main() {
     let mut ref_len = 500usize;
     let mut alt_len = 500usize;
     let mut iters = 3usize;
+    let mut backend = Backend::detect();
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let v = it.next().expect("value");
@@ -33,6 +34,7 @@ fn main() {
             "--ref-len" => ref_len = v.parse().unwrap(),
             "--alt-len" => alt_len = v.parse().unwrap(),
             "--iters" => iters = v.parse().unwrap(),
+            "--backend" => backend = v.parse().unwrap(),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -51,8 +53,10 @@ fn main() {
     }
     let params = SwParameters::new(200, -150, -260, -11);
     let cells: u64 = data.iter().map(|(r, a)| (r.len() * a.len()) as u64).sum();
+    let make_aligner =
+        || Aligner::with_backend(backend).expect("backend not available on this CPU");
     for (label, mut aligner) in
-        [("aligner:  ", Aligner::new()), ("wide only:", Aligner::new().without_narrow_lanes())]
+        [("aligner:  ", make_aligner()), ("wide only:", make_aligner().without_narrow_lanes())]
     {
         let mut best = f64::INFINITY;
         for _ in 0..iters {
