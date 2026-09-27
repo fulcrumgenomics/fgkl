@@ -27,6 +27,9 @@ use crate::{Backend, HapSet, Precision, ReadRef, RunnerKey};
 /// Prior tables always cover these bases; any other byte occurring in a haplotype gets its own.
 const STANDARD_BASES: [u8; 5] = *b"ACGTN";
 
+/// Upper bound on the lane count of any instantiation, for per-lane scratch kept on the stack.
+const MAX_LANES: usize = 64;
+
 /// Haplotypes in kernel order plus the bookkeeping for sharing prefixes and suffixes.
 pub(crate) struct SortedHaps<'a> {
     /// `order[k]` is the caller's index of the k-th sorted haplotype.
@@ -208,6 +211,7 @@ pub(crate) struct Runner<S: Simd> {
 
 impl<S: Simd> Runner<S> {
     pub fn new() -> Self {
+        const { assert!(S::LANES <= MAX_LANES) };
         Runner { ws: Workspace::new() }
     }
 
@@ -771,11 +775,12 @@ impl<S: Simd> Workspace<S> {
     fn join(&mut self, node: usize, hap_len: usize) {
         let lanes = S::LANES;
         let node = &self.bwd_nodes[node];
-        let crossing = &mut self.joined[..lanes];
-        crossing.fill(0.0);
+        // Summed in a local array, which the compiler knows aliases none of the rows it reads,
+        // over slices of exactly `lanes` elements, a compile-time constant: both are needed for
+        // the loop to vectorise.
+        let mut crossing = [0.0f64; MAX_LANES];
+        let crossing = &mut crossing[..lanes];
         for i in 1..=self.rows {
-            // Slices of exactly `lanes` elements, a compile-time constant, so the loop below
-            // vectorises.
             let fm = &self.join_m[i * lanes..][..lanes];
             let bm = &node.m[i * lanes..][..lanes];
             let fy = &self.join_y[i * lanes..][..lanes];
@@ -787,9 +792,9 @@ impl<S: Simd> Workspace<S> {
         // The rounded initial value the forward sweep used, so both halves weight starts alike.
         let init = S::Elem::from_f64(S::Elem::INITIAL_CONSTANT.to_f64() / hap_len as f64).to_f64();
         let scale = S::Elem::BACKWARD_SCALE.to_f64();
-        for (lane, raw) in crossing.iter_mut().enumerate() {
+        for (lane, (raw, &sum)) in self.joined.iter_mut().zip(crossing.iter()).enumerate() {
             let starts_after = init * node.s[lane].to_f64();
-            *raw = self.acc[lane].to_f64() + (*raw + starts_after) / scale;
+            *raw = self.acc[lane].to_f64() + (sum + starts_after) / scale;
         }
     }
 
