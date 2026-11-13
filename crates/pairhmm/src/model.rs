@@ -35,14 +35,18 @@ pub struct Tables {
 
 impl Tables {
     fn new() -> Self {
-        let error_prob: Vec<f64> = (0..=MAX_QUAL).map(|q| 10f64.powf(q as f64 / -10.0)).collect();
+        // `black_box` keeps each `powf` a call to `pow`, as Java's `Math.pow(10, x)` is: with a
+        // literal base LLVM rewrites it into `exp10`, which rounds differently (fgkl#25).
+        let error_prob: Vec<f64> =
+            (0..=MAX_QUAL).map(|q| std::hint::black_box(10f64).powf(q as f64 / -10.0)).collect();
         let mut match_to_match = vec![0.0; ((MAX_QUAL + 1) * (MAX_QUAL + 2)) / 2];
         let mut offset = 0;
         for i in 0..=MAX_QUAL {
             for j in 0..=i {
                 let log10_sum = approximate_log10_sum_log10(-0.1 * i as f64, -0.1 * j as f64);
-                let m2m_log10 = (-(10f64.powf(log10_sum)).min(1.0)).ln_1p() * INV_LN10;
-                match_to_match[offset + j] = 10f64.powf(m2m_log10);
+                let m2m_log10 =
+                    (-(std::hint::black_box(10f64).powf(log10_sum)).min(1.0)).ln_1p() * INV_LN10;
+                match_to_match[offset + j] = std::hint::black_box(10f64).powf(m2m_log10);
             }
             offset += i + 1;
         }
@@ -98,7 +102,7 @@ fn approximate_log10_sum_log10(a: f64, b: f64) -> f64 {
 /// `log10(1 + 10^-diff)` evaluated at the table point GATK would look up.
 fn jacobian(diff: f64) -> f64 {
     let k = fast_round(diff * JACOBIAN_INV_STEP);
-    (1.0 + 10f64.powf(-(k as f64) * JACOBIAN_TABLE_STEP)).log10()
+    (1.0 + std::hint::black_box(10f64).powf(-(k as f64) * JACOBIAN_TABLE_STEP)).log10()
 }
 
 fn fast_round(d: f64) -> i64 {
@@ -130,6 +134,12 @@ mod tests {
     }
 
     #[test]
+    fn error_prob_has_javas_bits() {
+        // `Math.pow(10.0, -0.4)` in Java; `exp10(-0.4)` is one ULP above it.
+        assert_eq!(TABLES.error_prob(4).to_bits(), 0x3fd9_7a96_7f75_24b2);
+    }
+
+    #[test]
     fn match_to_match_at_zero_quals_is_zero() {
         assert_eq!(TABLES.match_to_match(0, 0), 0.0);
     }
@@ -147,7 +157,8 @@ mod tests {
     #[test]
     fn approximate_log10_sum_matches_exact_for_moderate_differences() {
         let (a, b) = (-3.0, -2.5);
-        let exact = (10f64.powf(a) + 10f64.powf(b)).log10();
+        let exact =
+            (std::hint::black_box(10f64).powf(a) + std::hint::black_box(10f64).powf(b)).log10();
         assert!((approximate_log10_sum_log10(a, b) - exact).abs() < 1e-4);
         assert_eq!(approximate_log10_sum_log10(a, b), approximate_log10_sum_log10(b, a));
         assert_eq!(approximate_log10_sum_log10(-20.0, -2.0), -2.0);

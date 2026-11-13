@@ -4,6 +4,10 @@ Notable changes to fgkl, newest first. The format follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Fixed
+
+- PairHMM: the double-precision tables are built with `pow(10, x)`, as GATK's `Math.pow` computes them, rather than the `exp10(x)` LLVM substituted for `10f64.powf(x)`. On aarch64-apple-darwin this moved the error probability of Q4 and Q196 by one ULP, and 38 of 20,000 synthetic double-precision likelihoods by up to 128 ULP; with the fix the scalar double kernel matches `LoglessPairHMM` bit for bit on them ([#25](https://github.com/fulcrumgenomics/fgkl/issues/25)).
+
 ## [0.2.0] - 2026-09-27
 
 ### Changed
